@@ -25,9 +25,14 @@ else
     docker run --platform linux/amd64 --rm \
         -v "${APP_DIR}/app/server":/output \
         -w /build alpine:latest sh -c '
+            set -e
             apk add --no-cache git g++ make linux-headers > /dev/null 2>&1
             git clone --depth 1 "$1" > /dev/null 2>&1
-            cd ugreen_leds_controller/cli
+            cd ugreen_leds_controller
+            git fetch --depth 1 origin af2b7ae84f65a8730768d4b626570bc824b196e0 > /dev/null 2>&1
+            git checkout af2b7ae84f65a8730768d4b626570bc824b196e0 > /dev/null 2>&1
+            [ "$(git rev-parse HEAD)" = "af2b7ae84f65a8730768d4b626570bc824b196e0" ]
+            cd cli
             make > /dev/null 2>&1
             cp ugreen_leds_cli /output/
         ' -- "$CLI_SRC_URL"

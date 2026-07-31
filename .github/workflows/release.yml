@@ -23,9 +23,14 @@ jobs:
           docker run --platform linux/amd64 --rm \
             -v "$PWD/src/app/server":/output \
             -w /build alpine:latest sh -c '
+              set -e
               apk add --no-cache git g++ make linux-headers
               git clone --depth 1 https://github.com/miskcoo/ugreen_leds_controller.git
-              cd ugreen_leds_controller/cli && make
+              cd ugreen_leds_controller
+              git fetch --depth 1 origin af2b7ae84f65a8730768d4b626570bc824b196e0
+              git checkout af2b7ae84f65a8730768d4b626570bc824b196e0
+              test "$(git rev-parse HEAD)" = "af2b7ae84f65a8730768d4b626570bc824b196e0"
+              cd cli && make
               cp ugreen_leds_cli /output/
             '
 

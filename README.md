@@ -126,6 +126,11 @@ src/app/server/
 
 构建流程：生成图标 → 编译 `ugreen_leds_cli`（Docker）→ `fnpack build` → 收集 fpk。
 
+> **CLI pin 上游 commit `af2b7ae`（2026-07-30，add pve9 pinned interface naming support #113）**
+> - 三个构建入口（`release.yml` / `build.ps1` / `build.sh`）在 clone 后统一 `git fetch --depth 1 origin af2b7ae84f65a8730768d4b626570bc824b196e0 && git checkout af2b7ae84f65a8730768d4b626570bc824b196e0`，并以 `git rev-parse HEAD` 断言，确保构建产物不受上游漂移影响。
+> - 已提交的捆绑二进制 `src/app/server/ugreen_leds_cli` 由 pin commit 构建（构建脚本检测到二进制存在时跳过 Docker 构建）。SHA256：`9938C0E7A83884F7783ED10BA973DACE16D91792EA3E3CA07F80A3D638D05E32`。
+> - 已验证：本地 `tools/ugreen_leds_controller` HEAD = `af2b7ae84f65a8730768d4b626570bc824b196e0`，与 pin 一致。
+
 ---
 
 ## API 概览
