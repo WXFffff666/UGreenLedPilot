@@ -1,252 +1,125 @@
-# FnUGreenLed — Development Specification
+# UGreenLedPilot — Development Specification
 
 ## Overview
 
-FnUGreenLed is a native fnOS application that provides LED indicator control for UGREEN NAS devices. It lets users control front-panel LEDs for power, network, and disk bays through a skeuomorphic web interface, with per-LED modes for off, solid on, and automatic activity indication.
+UGreenLedPilot is a native fnOS application for **UGREEN DXP4800 Plus** LED control. Users manage power, network, and disk bay indicators through a web UI with per-LED modes: off, solid on, and automatic (presence + activity).
+
+All hardware access goes through `ugreen_leds_cli` from [miskcoo/ugreen_leds_controller](https://github.com/miskcoo/ugreen_leds_controller). No kernel module or alternate driver path is used at runtime.
+
+**Current version:** 2.1.0
 
 ## Project History
 
-### Version 1 — App.Native.LEDController
-
-The initial prototype was built as `App.Native.LEDController` (v1.0.0), manually assembled without the fnpack CLI tool. It established the core architecture:
-
-- **CGI backend** (`app/server/index.cgi`): Python 3 CGI script handling GET (serve HTML) and POST (LED control API) requests
-- **Frontend** (separated files): `app/ui/index.html` (structure), `app/www/css/style.css` (styling), `app/www/js/app.js` (interaction logic)
-- **Desktop entry**: iframe-based integration via `/cgi/ThirdParty/App.Native.LEDController/index.cgi/`
-- **Driver dependency**: Relies on `ugreen_leds_cli` from [miskcoo/ugreen_leds_controller](https://github.com/miskcoo/ugreen_leds_controller)
-
-This version was functional but did not follow fnOS packaging standards — it was hand-assembled rather than using `fnpack create` / `fnpack build`.
-
-### Version 2 — FnUGreenLed (Current)
-
-Rebuilt from scratch using `fnpack create` to generate a standards-compliant project structure, then migrated all features from V1 with improvements:
-
-- **Self-hosted HTTP server** (`app/server/main.py`): Python HTTP server (instead of CGI), serves embedded HTML/CSS/JS and JSON API
-- **Bundled LED driver**: Static x86_64 binary of `ugreen_leds_cli` cross-compiled via Docker (Alpine Linux, musl-g++) and included in the package
-- **Desktop entry**: Standard `type: "url"` with port 19580 to avoid common 8080 conflicts
-- **Process management**: Full `cmd/main` lifecycle (start/stop/status) managing the Python server
-- **System integration**: `usr-local-linker` symlinks the bundled CLI to `/usr/local/bin/`
-- Error handling updated to fnOS V1.1.8+ conventions
-- Built and packaged with `fnpack build` → `FnUGreenLed-1.1.0.x86_64.fpk`
-
-### Version 2.1 — FnUGreenLed v1.1.0
-
-The current uncommitted code expands the app from fixed DXP4800 manual control into a multi-bay controller:
-
-- **Three LED modes**: `off`, `on`, and `auto`
-- **State persistence**: Saves LED modes to `TRIM_PKGVAR/led_state.json` and restores them on service start
-- **LED probing**: Uses `ugreen_leds_cli all -status` to detect available LEDs and read current hardware modes
-- **Model probing**: Uses DMI product name (`dmidecode --string system-product-name` or `/sys/class/dmi/id/product_name`) to infer known UGREEN model families
-- **Dynamic UI**: Renders disk bays according to detected or configured disk count
-- **Configuration API**: `POST /api/config` can switch disk count manually
-- **Reset API**: `POST /api/reset` clears local config/state and returns the app to the initialization page
-- **Status API**: `GET /api/status` exposes current modes, activity state, detected disk map, and selected network interface
-- **Activity monitoring**: Auto mode polls `/sys/class/net/*/statistics` and `/sys/block/*/stat`
-- **Disk mapping**: Uses ATA mapping by default and applies the upstream DXP6800 slot order override
-
-### Version 2.2 — FnUGreenLed v1.2.0 (Current, maintained by WXFffff666)
-
-Released June 2026. Adds explicit DXP4800 Plus model support:
-
-- **DXP4800 Plus model profile**: Dual-prefix DMI matching (`DXP4800Plus` + `DXP4800 Plus`) added to `MODEL_PROFILES` before the generic `DXP4800` entry, ensuring correct model ID assignment for devices whose DMI product name includes "Plus"
-- **Same hardware protocol**: DXP4800 Plus confirmed to use identical I2C protocol (bus 1, addr 0x3a) and ATA slot mapping (ata1-ata4) as DXP4800 — upstream `miskcoo/ugreen_leds_controller` and community (Kerryliu TrueNAS guide) corroborate this
-- **LED driver recompiled**: `ugreen_leds_cli` rebuilt from latest upstream HEAD via Docker Alpine cross-compilation
-- **Device assets marked verified**: `assets/devices/dxp4800plus/config.json` and `assets/devices/devices.json` updated to `verified: true`
-- **Roadmap and README**: Documentation updated to reflect verified DXP4800 Plus support
-- **fnpack build output**: `FnUGreenLed-1.2.0.x86_64.fpk`
+| Version | Summary |
+|---------|---------|
+| v1.0.0 | Forked from FnOSxUGreenLedDriver; basic control, fnpack packaging |
+| v1.1.0 | Mode-aware hotplug; DXP4800 Plus only; CSRF, rate limit, PBKDF2 |
+| v2.0.0 | Modular architecture; SSE; CLI dedup; separate `www` frontend |
+| v2.1.0 | netlink uevent hotplug; tiered monitor sleep; activity-blink toggle; glassmorphism UI |
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                  fnOS Desktop                         │
-│  ┌────────────────────────────────────────────────┐  │
-│  │  Browser (new tab)                              │  │
-│  │  ┌──────────────────────────────────────────┐  │  │
-│  │  │  http://127.0.0.1:19580                   │  │  │
-│  │  │  ┌─────────────────────────────────┐     │  │  │
-│  │  │  │  main.py (Python HTTP Server)   │     │  │  │
-│  │  │  │  GET  /     → Embedded HTML/CSS/JS   │  │  │
-│  │  │  │  POST /api/control → JSON API  │     │  │  │
-│  │  │  └────────────┬────────────────────┘     │  │  │
-│  │  └───────────────│──────────────────────────┘  │  │
-│  └──────────────────│─────────────────────────────┘  │
-│                     │ subprocess                       │
-│                     ▼                                  │
-│  ┌─────────────────────────────────────────────────┐  │
-│  │  ugreen_leds_cli (static x86_64 binary)         │  │
-│  │  Bundled: /var/apps/FnUGreenLed/target/server/  │  │
-│  │  Symlink: /usr/local/bin/ugreen_leds_cli        │  │
-│  └─────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  Browser  →  http://127.0.0.1:19580                     │
+│    ├── GET  /static/*     → www/ (HTML/CSS/JS)          │
+│    ├── GET  /api/status   → JSON state                  │
+│    ├── GET  /api/events   → SSE push                    │
+│    └── POST /api/*        → REST (auth + CSRF)          │
+│                          │                               │
+│                          ▼                               │
+│  main.py (ThreadingHTTPServer)                          │
+│    ├── http_handler.py                                  │
+│    ├── app_context.py                                   │
+│    ├── pilot_core.py                                    │
+│    │     ├── uevent_watcher.py  (netlink hotplug)       │
+│    │     └── make_cli_runner()  → ugreen_leds_cli      │
+│    └── auth_manager.py                                  │
+└─────────────────────────────────────────────────────────┘
 ```
 
-## Features
+## Monitor Tiers
 
-| Feature | Description |
-|---------|-------------|
-| Power LED control | Set power indicator to off/on/auto |
-| Network LED control | Set network indicator to off/on/auto; auto follows network traffic |
-| Disk bay LED control | Independently set each detected/configured disk bay indicator |
-| Batch all-on | Set all LEDs to solid on |
-| Batch all-auto | Set all LEDs to automatic mode |
-| Batch all-off | Turn all LEDs off |
-| State persistence | Restore saved LED modes on service start |
-| Dynamic disk count | Detect or manually configure 1-8 disk bays |
-| Hardware state import | Prefer `ugreen_leds_cli all -status` over persisted local state when available |
-| Model-assisted mapping | Uses DMI product name to pick known disk count and ATA mapping |
-| Reset configuration | Clear local config/state and re-enter initialization |
-| Visual feedback | Skeuomorphic toggle switches with LED glow animation |
-| Toast notifications | Success/error messages with auto-dismiss |
+| Tier | Condition | Behavior |
+|------|-----------|----------|
+| `sleep` | No LED in `auto` mode | Monitor thread blocks on `Event.wait()`; uevent stopped |
+| `hotplug` | `auto` mode, activity blink off | uevent on block add/remove; 120s signature fallback |
+| `activity` | `auto` mode, activity blink on | uevent + sysfs IO poll with idle backoff (0.5s → 3s) |
 
-## API Specification
+## Device Profile
 
-### POST `http://127.0.0.1:19580/api/control`
-
-**Request:**
-```json
-{
-    "led": "power|netdev|disk1|disk2|...",
-    "action": "off|on|auto"
+```python
+DXP4800_PLUS_PROFILE = {
+    'id': 'dxp4800plus',
+    'disk_count': 4,
+    'hctl_map': ['0:0:0:0', '1:0:0:0', '2:0:0:0', '3:0:0:0'],
+    'ata_map': ['ata1', 'ata2', 'ata3', 'ata4'],
 }
 ```
 
-**Response (success):**
-```json
-{
-    "success": true,
-    "message": "power → 常亮"
-}
-```
+## API Endpoints
 
-**Response (error):**
-```json
-{
-    "success": false,
-    "message": "无效指示灯: panel"
-}
-```
+Authenticated POST routes require session cookie + `X-CSRF-Token`.
 
-### GET `http://127.0.0.1:19580/api/status`
+| Method | Path | Body | Description |
+|--------|------|------|-------------|
+| POST | `/api/login` | `{password}` | Create session |
+| GET | `/api/status` | — | Full state snapshot |
+| GET | `/api/events` | — | SSE stream |
+| POST | `/api/control` | `{led, action}` | Set mode: off/on/auto |
+| POST | `/api/color` | `{led, r, g, b}` | Set RGB |
+| POST | `/api/brightness` | `{led?, brightness}` | Per-LED or global brightness |
+| POST | `/api/preset` | `{led, preset}` | Apply color preset |
+| POST | `/api/activity-blink` | `{enabled}` | Toggle IO activity polling |
+| POST | `/api/all/{off\|on\|auto}` | — | Batch mode |
+| POST | `/api/remap` | — | Force disk remap |
+| POST | `/api/change-password` | `{old_password, new_password}` | Change admin password |
+| POST | `/api/reset` | — | Clear config and state |
 
-Returns persisted modes, current auto-mode activity flags, disk map, network interface, and active LED list.
+LED names: `power`, `netdev`, `disk1`–`disk4`.
 
-### POST `http://127.0.0.1:19580/api/all/off|on|auto`
+## Security
 
-Batch-sets every active LED.
+| Control | Implementation |
+|---------|----------------|
+| Authentication | Single admin, session cookie (`HttpOnly`, `SameSite=Strict`, 7d) |
+| CSRF | `X-CSRF-Token` on all state-changing POST |
+| Rate limiting | 5 failed logins / 15 min lockout per IP |
+| Password | PBKDF2-SHA256, 200k iterations; min 8, max 128 chars |
+| Origin check | Host must match `Origin` / `Referer` |
+| Headers | `X-Content-Type-Options`, `X-Frame-Options`, CSP, `X-Robots-Tag` |
+| Static files | Path traversal blocked (`..` rejected) |
+| CLI | Fixed path, no shell, LED name regex validated |
 
-### GET/POST `http://127.0.0.1:19580/api/config`
-
-Reads or updates disk count configuration:
-
-```json
-{
-    "disk_count": 6,
-    "model": "manual"
-}
-```
-
-### POST `http://127.0.0.1:19580/api/reset`
-
-Clears local configuration and persisted LED modes:
-
-- `TRIM_PKGVAR/device_config.json`
-- `TRIM_PKGVAR/led_state.json`
-
-After reset, `GET /` returns the initialization page until the user saves a new disk count.
-
-### GET `http://127.0.0.1:19580/`
-
-Returns the initialization page when no local config exists; otherwise returns the self-contained control page with embedded CSS and JavaScript.
-
-## LED Mapping
-
-| LED ID | Physical Indicator | Description |
-|--------|-------------------|-------------|
-| `power` | Front panel power LED | Device power status |
-| `netdev` | Front panel network LED | Network activity |
-| `disk1` | Bay 1 LED | Disk slot 1 |
-| `disk2` | Bay 2 LED | Disk slot 2 |
-| `disk3` | Bay 3 LED | Disk slot 3 |
-| `disk4` | Bay 4 LED | Disk slot 4 |
-| `disk5`-`disk8` | Bay 5-8 LED | Present when detected/configured on larger models |
-
-## UI Design
-
-Skeuomorphic design mimicking the UGREEN DXP4800 NAS physical chassis:
-
-- **Color palette**: Dark metallic case (#2a2a2a–#3d3d3d), green LEDs (#00ff88 with glow effect)
-- **Components**: 
-  - Header bar with checkmark icon and pulsing status dot
-  - Power/Network section with large toggle switches
-  - 4-bay disk grid with numbered bays, disk icons, and compact toggle switches
-  - Footer action bar with "全部开启" (all on) and "全部关闭" (all off) buttons
-- **Interactions**: Hover lift effects, press depression, smooth toggle animations, toast notifications
-- **Responsive**: Adapts to tablet and mobile widths
-
-## Dependencies
-
-| Dependency | Version | Purpose |
-|------------|---------|---------|
-| Python 3 | ≥3.6 | CGI runtime |
-| GCC | any | Compile LED driver (install-time only) |
-| Git | any | Clone LED driver repo (install-time only) |
-| [ugreen_leds_cli](https://github.com/miskcoo/ugreen_leds_controller) | latest | LED hardware control binary |
-
-## Project Structure (fnpack standard)
+## Project Structure
 
 ```
-FnUGreenLed/
-├── app/
-│   ├── server/
-│   │   ├── main.py             # Python HTTP server (embedded HTML/CSS/JS + API)
-│   │   └── ugreen_leds_cli     # Static x86_64 LED driver binary
-│   └── ui/
-│       ├── config              # Desktop entry (url → port 19580)
-│       └── images/
-│           ├── icon_64.png     # 64×64 UI icon
-│           └── icon_256.png    # 256×256 UI icon
-├── cmd/
-│   ├── main                    # Lifecycle: start/stop/status (Python server process)
-│   ├── install_init            # Setup hook
-│   ├── install_callback        # Post-install hook
-│   ├── uninstall_init          # Pre-uninstall hook
-│   ├── uninstall_callback      # Post-uninstall hook
-│   ├── upgrade_init            # Pre-upgrade hook
-│   ├── upgrade_callback        # Post-upgrade hook
-│   ├── config_init             # Pre-config-change hook
-│   └── config_callback         # Post-config-change hook
-├── config/
-│   ├── privilege               # run-as: root (hardware I2C access)
-│   └── resource                # data-share + usr-local-linker
-├── wizard/                     # User interaction wizards (empty)
-├── manifest                    # App metadata (service_port=19580)
-├── ICON.PNG                    # 64×64 App Center icon
-└── ICON_256.PNG                # 256×256 App Center icon
+UGreenLedPilot/
+├── src/
+│   ├── app/server/          # Python backend + www frontend
+│   ├── app/ui/              # fnOS desktop entry
+│   ├── cmd/                 # Lifecycle scripts
+│   ├── config/              # privilege, resource
+│   ├── wizard/
+│   └── manifest
+├── build.ps1 / build.sh
+├── tests/test_pilot_core.py
+└── README.md
 ```
 
-## Manifest Configuration
+## Manifest
 
-| Field | Value | Rationale |
-|-------|-------|-----------|
-| `appname` | FnUGreenLed | Unique app identifier |
-| `version` | 1.2.0 | Semantic versioning |
-| `display_name` | 指示灯控制 | Chinese display name |
-| `service_port` | 19580 | HTTP server listening port |
-| `desktop_uidir` | ui | Standard UI directory |
-| `desktop_applaunchname` | FnUGreenLed.Application | Matches entry key in `app/ui/config` |
-| `maintainer` | WXFffff666 | Fork maintainer (original: Mikawawawa) |
-| `distributor` | WXFffff666 | Fork distributor |
-
-## Privilege Configuration
-
-- `run-as: root` — Required for direct hardware (I2C bus) access to LED controller chip at address 0x3a
-- Custom user/group: `ledcontroller` / `ledcontroller`
+| Field | Value |
+|-------|-------|
+| `appname` | UGreenLedPilot |
+| `version` | 2.1.0 |
+| `service_port` | 19580 |
+| `arch` | x86_64 |
 
 ## Known Limitations
 
-1. **Hardware truth is write-biased**: The app persists requested LED modes, but `ugreen_leds_cli` is still primarily a write tool; true hardware state can diverge if changed outside the app
-2. **Auto mode is heuristic**: Disk and network activity are inferred from Linux `/sys` counters
-3. **Model detection coverage**: Now covers DXP2800, DXP4800, DXP4800 Plus, DXP6800, DXP8800, DX4600, DX4700. Additional UGREEN models require DMI profiling
-4. **No authentication**: API endpoint has no authentication beyond the fnOS desktop session
-5. **x86_64 only**: Compiled driver targets x86 architecture; ARM NAS models are not supported
+1. **DXP4800 Plus only** — other UGREEN models are not supported
+2. **Hardware truth is write-biased** — external CLI changes may diverge from app state
+3. **Auto mode is heuristic** — activity inferred from `/sys` counters
+4. **uevent fallback** — if netlink unavailable, 120s signature poll is used
+5. **x86_64 only** — ARM NAS not supported
