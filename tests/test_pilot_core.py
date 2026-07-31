@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Unit tests for UGreenLedPilot v2.1."""
 
+import hashlib
+import json
 import os
+import secrets
+import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src' / 'app' / 'server'))
 
@@ -15,7 +19,8 @@ from pilot_core import (
     quick_hardware_signature, DEFAULT_SETTINGS, NETDEV_ORANGE, WHITE,
     DXP4800_PLUS_PROFILE, PilotController, StatusBroadcaster,
 )
-from auth_manager import AuthManager
+from auth_manager import AuthManager, PBKDF2_ITERATIONS
+from http_handler import PilotHandler
 
 
 class TestDXP4800PlusMapping(unittest.TestCase):
@@ -127,6 +132,51 @@ class TestSetColorOffSemantics(unittest.TestCase):
             'power', '-on', '-color', '0', '255', '0', '-brightness', '255')
 
 
+class TestDiskIoCounterReset(unittest.TestCase):
+    """Disk IO counter reset must not be treated as activity (delta=0)."""
+
+    def _make_ctrl(self):
+        run = MagicMock(return_value=(True, '', ''))
+        ctrl = PilotController(
+            ['power', 'netdev', 'disk1', 'disk2'],
+            run, '/tmp/test_state.json', '/tmp/test_settings.json',
+            disk_count=2,
+        )
+        ctrl._disk_map = {1: 'sda'}
+        ctrl.modes['disk1'] = 'auto'
+        ctrl.activity['disk1'] = False
+        ctrl._prev_disk_io[1] = 100
+        return ctrl
+
+    def test_counter_reset_not_treated_as_activity(self):
+        ctrl = self._make_ctrl()
+        # First read matches prev (steady state), second read is a counter reset.
+        with patch('pilot_core.disk_present', return_value=True), \
+                patch('pilot_core.read_disk_io', side_effect=[100, 5]):
+            self.assertFalse(ctrl._check_disks())
+            self.assertFalse(ctrl._check_disks())
+        self.assertFalse(ctrl.activity['disk1'])
+        self.assertEqual(ctrl._prev_disk_io[1], 5)
+        for call in ctrl.run.call_args_list:
+            self.assertNotIn('-blink', call.args)
+
+    def test_normal_activity_still_triggers_blink(self):
+        ctrl = self._make_ctrl()
+        with patch('pilot_core.disk_present', return_value=True), \
+                patch('pilot_core.read_disk_io', side_effect=[100, 150]):
+            ctrl._check_disks()
+            self.assertTrue(ctrl._check_disks())
+        self.assertTrue(ctrl.activity['disk1'])
+        self.assertEqual(ctrl._prev_disk_io[1], 150)
+        self.assertTrue(any('-blink' in call.args for call in ctrl.run.call_args_list))
+
+    def test_absent_disk_clears_prev_io(self):
+        ctrl = self._make_ctrl()
+        with patch('pilot_core.disk_present', return_value=False):
+            self.assertFalse(ctrl._check_disks())
+        self.assertNotIn(1, ctrl._prev_disk_io)
+
+
 class TestBroadcaster(unittest.TestCase):
     def test_publish_notify(self):
         bc = StatusBroadcaster()
@@ -153,6 +203,105 @@ class TestAuthSecurity(unittest.TestCase):
         ok, msg = self.auth.change_password('admin123', 'a' * 129)
         self.assertFalse(ok)
         self.assertIn('128', msg)
+
+
+class TestAuthUsername(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.auth_file = os.path.join(self.dir, 'auth.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _make_handler(self):
+        handler = PilotHandler.__new__(PilotHandler)
+        handler.app = MagicMock()
+        handler.app.auth = self.auth
+        handler.client_address = ('127.0.0.1', 5555)
+        handler.headers = {}
+        handler.rfile = MagicMock()
+        handler.wfile = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        return handler
+
+    def _login_response(self, payload):
+        handler = self._make_handler()
+        handler._login(payload)
+        status = handler.send_response.call_args_list[0][0][0]
+        body = json.loads(handler.wfile.write.call_args[0][0].decode())
+        return status, body
+
+    def test_fresh_install_default_admin(self):
+        auth = AuthManager(self.auth_file)
+        self.assertEqual(auth.cfg['username'], 'admin')
+        with open(self.auth_file) as f:
+            self.assertEqual(json.load(f)['username'], 'admin')
+
+    def test_v210_migration_adds_admin_keeps_hash(self):
+        salt = secrets.token_hex(16)
+        digest = hashlib.pbkdf2_hmac(
+            'sha256', 'oldpass'.encode(), salt.encode(), PBKDF2_ITERATIONS).hex()
+        with open(self.auth_file, 'w') as f:
+            json.dump({
+                'password_hash': digest,
+                'password_salt': salt,
+                'must_change_password': True,
+                'session': '',
+                'csrf_token': '',
+                'session_created': 0,
+            }, f)
+        auth = AuthManager(self.auth_file)
+        self.assertEqual(auth.cfg['username'], 'admin')
+        self.assertEqual(auth.cfg['password_hash'], digest)
+        self.assertEqual(auth.cfg['password_salt'], salt)
+        self.assertTrue(auth.must_change_password())
+        self.assertTrue(auth.verify_credentials('admin', 'oldpass'))
+
+    def test_verify_wrong_username_fails(self):
+        self.auth = AuthManager(self.auth_file)
+        self.assertFalse(self.auth.verify_credentials('bad_user', 'admin123'))
+
+    def test_verify_wrong_password_fails(self):
+        self.auth = AuthManager(self.auth_file)
+        self.assertFalse(self.auth.verify_credentials('admin', 'wrongpass'))
+
+    def test_verify_empty_username_fails(self):
+        self.auth = AuthManager(self.auth_file)
+        self.assertFalse(self.auth.verify_credentials('', 'admin123'))
+
+    def test_verify_anti_enumeration_indistinguishable(self):
+        self.auth = AuthManager(self.auth_file)
+        bad_user = self.auth.verify_credentials('bad_user', 'bad_pw')
+        bad_pass = self.auth.verify_credentials('admin', 'bad_pw')
+        self.assertFalse(bad_user)
+        self.assertEqual(bad_user, bad_pass)
+
+    def test_login_wrong_username_401(self):
+        self.auth = AuthManager(self.auth_file)
+        status, body = self._login_response({'username': 'bad_user', 'password': 'admin123'})
+        self.assertEqual(status, 401)
+        self.assertEqual(body['message'], '用户名或密码错误')
+
+    def test_login_missing_username_401(self):
+        self.auth = AuthManager(self.auth_file)
+        status, body = self._login_response({'password': 'admin123'})
+        self.assertEqual(status, 401)
+        self.assertEqual(body['message'], '用户名或密码错误')
+
+    def test_login_wrong_password_401_same_message(self):
+        self.auth = AuthManager(self.auth_file)
+        status, body = self._login_response({'username': 'admin', 'password': 'wrong'})
+        self.assertEqual(status, 401)
+        self.assertEqual(body['message'], '用户名或密码错误')
+
+    def test_login_success_admin_200(self):
+        self.auth = AuthManager(self.auth_file)
+        status, body = self._login_response({'username': 'admin', 'password': 'admin123'})
+        self.assertEqual(status, 200)
+        self.assertTrue(body['success'])
+        self.assertTrue(body['csrf_token'])
 
 
 if __name__ == '__main__':

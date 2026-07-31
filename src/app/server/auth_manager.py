@@ -10,6 +10,7 @@ SESSION_MAX_AGE = 86400 * 7  # 7 days
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_SECONDS = 900  # 15 minutes
 PBKDF2_ITERATIONS = 200000
+DEFAULT_USERNAME = 'admin'
 
 
 def load_json(path, default):
@@ -35,6 +36,9 @@ class AuthManager:
         self.auth_file = auth_file
         self.cfg = load_json(auth_file, {})
         self._login_attempts = {}
+        if 'username' not in self.cfg:
+            self.cfg.setdefault('username', DEFAULT_USERNAME)
+            self.save()
         if 'password_hash' not in self.cfg and 'password' not in self.cfg:
             self.set_password('admin123')
             self.cfg['must_change_password'] = True
@@ -67,6 +71,12 @@ class AuthManager:
             return secrets.compare_digest(password, fallback)
         _, digest = self._hash(password, salt)
         return secrets.compare_digest(digest, expected)
+
+    def verify_credentials(self, username, password):
+        expected = self.cfg.get('username', DEFAULT_USERNAME)
+        if not secrets.compare_digest(username, expected):
+            return False
+        return self.verify_password(password)
 
     def _client_key(self, ip):
         return ip or 'unknown'

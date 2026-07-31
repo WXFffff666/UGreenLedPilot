@@ -779,11 +779,12 @@ class PilotController:
                     self.presence[led] = False
                     self._apply(led, 'auto', activity=False)
                     changed = True
+                self._prev_disk_io.pop(slot, None)
                 continue
             self.presence[led] = True
             io = read_disk_io(f'/sys/block/{dev}/stat')
             prev = self._prev_disk_io.get(slot, 0)
-            delta = io - prev if io >= prev else io
+            delta = io - prev if io >= prev else 0
             active = delta >= ACTIVITY_IO_THRESHOLD
             self._prev_disk_io[slot] = io
             if active != self.activity.get(led):

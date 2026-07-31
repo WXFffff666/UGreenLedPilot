@@ -5,7 +5,7 @@ import mimetypes
 import os
 import re
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 from app_context import APP_VERSION, WWW_DIR
 from pilot_core import VALID_MODES
@@ -21,6 +21,24 @@ def validate_led(led):
 
 def validate_mode(mode):
     return mode in VALID_MODES
+
+
+def _header_host(url):
+    """Extract lowercase hostname from an Origin/Referer URL, or None if invalid.
+
+    Returns None when the host is missing or the port segment is not
+    numeric, so that crafted values like ``http://127.0.0.1:19580.evil.com``
+    (whose parsed hostname would be ``127.0.0.1``) are rejected.
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return None
+        parsed.port  # raises ValueError when port segment is non-numeric
+        return hostname.lower()
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 class PilotHandler(BaseHTTPRequestHandler):
@@ -47,11 +65,14 @@ class PilotHandler(BaseHTTPRequestHandler):
         host = self.headers.get('Host', '')
         if not origin and not referer:
             return True
-        if origin and host and host in origin:
-            return True
-        if referer and host and host in referer:
-            return True
-        return False
+        try:
+            host_name = (urlparse('//' + host).hostname or '').lower()
+        except (ValueError, TypeError, AttributeError):
+            host_name = ''
+        for candidate in (origin, referer):
+            if candidate and _header_host(candidate) != host_name:
+                return False
+        return True
 
     def _require_auth(self):
         if not self.app.auth.is_authenticated(self.headers):
@@ -183,9 +204,10 @@ class PilotHandler(BaseHTTPRequestHandler):
                 'success': False,
                 'message': f'登录尝试过多，请 {remaining // 60 + 1} 分钟后再试',
             })
-        if not self.app.auth.verify_password(data.get('password', '')):
+        if not self.app.auth.verify_credentials(
+                data.get('username', ''), data.get('password', '')):
             self.app.auth.record_failed_login(ip)
-            return self._json(401, {'success': False, 'message': '密码错误'})
+            return self._json(401, {'success': False, 'message': '用户名或密码错误'})
         self.app.auth.record_successful_login(ip)
         session, csrf = self.app.auth.create_session()
         self.send_response(200)
