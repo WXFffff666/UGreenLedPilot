@@ -6,7 +6,7 @@ UGreenLedPilot is a native fnOS application for **UGREEN DXP4800 Plus** LED cont
 
 All hardware access goes through `ugreen_leds_cli` from [miskcoo/ugreen_leds_controller](https://github.com/miskcoo/ugreen_leds_controller). No kernel module or alternate driver path is used at runtime.
 
-**Current version:** 2.1.0
+**Current version:** 2.2.0
 
 ## Project History
 
@@ -16,6 +16,7 @@ All hardware access goes through `ugreen_leds_cli` from [miskcoo/ugreen_leds_con
 | v1.1.0 | Mode-aware hotplug; DXP4800 Plus only; CSRF, rate limit, PBKDF2 |
 | v2.0.0 | Modular architecture; SSE; CLI dedup; separate `www` frontend |
 | v2.1.0 | netlink uevent hotplug; tiered monitor sleep; activity-blink toggle; glassmorphism UI |
+| v2.2.0 | effect modes (breath/manual-blink/chase); speed-aware blink; single-user auth; multi-NIC activity; bay calibration; perf & reliability fixes |
 
 ## Architecture
 
@@ -112,7 +113,7 @@ UGreenLedPilot/
 | Field | Value |
 |-------|-------|
 | `appname` | UGreenLedPilot |
-| `version` | 2.1.0 |
+| `version` | 2.2.0 |
 | `service_port` | 19580 |
 | `arch` | x86_64 |
 

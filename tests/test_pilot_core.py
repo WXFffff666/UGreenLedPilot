@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for UGreenLedPilot v2.1."""
+"""Unit tests for UGreenLedPilot v2.2."""
 
 import hashlib
 import json
@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src' / 'app' / 'se
 from pilot_core import (
     map_disks_by_profile, disk_signature, net_signature, list_net_ifaces,
     quick_hardware_signature, DEFAULT_SETTINGS, NETDEV_ORANGE, WHITE,
-    DXP4800_PLUS_PROFILE, PilotController, StatusBroadcaster,
+    DXP4800_PLUS_PROFILE, EFFECT_PRIORITY, PilotController, StatusBroadcaster,
 )
 from auth_manager import AuthManager, PBKDF2_ITERATIONS
 from http_handler import PilotHandler
@@ -678,6 +678,215 @@ class TestChaseEffect(unittest.TestCase):
             ctrl._monitor_loop()
         self.assertTrue(any(c.args[0] == 'disk1' and '-off' not in c.args
                             for c in ctrl.run.call_args_list))
+
+
+class TestEffectPriorityMatrix(unittest.TestCase):
+    """F7d (Todo 19): off > on > manual-blink > breath > activity-blink > chase.
+
+    User effects (manual-blink/breath) outrank auto activity-blink; a later
+    lower-priority set_effect() call never demotes the active effect; effects
+    persist in led_settings.json (additive-only); restore_state / reapply
+    paths (set_activity_blink(False), _on_hardware_changed) keep user effects.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._ctrls = []
+
+    def tearDown(self):
+        for ctrl in self._ctrls:
+            if ctrl._settings_timer:
+                ctrl._settings_timer.cancel()
+        self._tmp.cleanup()
+
+    def _make_ctrl(self, disk_count=2):
+        run = MagicMock(return_value=(True, '', ''))
+        ctrl = PilotController(
+            ['power', 'netdev', 'disk1', 'disk2'],
+            run,
+            os.path.join(self._tmp.name, 'state.json'),
+            os.path.join(self._tmp.name, 'settings.json'),
+            disk_count=disk_count,
+        )
+        ctrl._uevent = MagicMock()
+        ctrl._uevent.is_running.return_value = False
+        self._ctrls.append(ctrl)
+        return ctrl
+
+    def test_priority_matrix_ordering(self):
+        self.assertEqual(EFFECT_PRIORITY['manual-blink'], 3)
+        self.assertEqual(EFFECT_PRIORITY['breath'], 2)
+        self.assertEqual(EFFECT_PRIORITY['activity-blink'], 1)
+        self.assertEqual(EFFECT_PRIORITY['chase'], 0)
+        self.assertGreater(EFFECT_PRIORITY['manual-blink'], EFFECT_PRIORITY['breath'])
+        self.assertGreater(EFFECT_PRIORITY['breath'], EFFECT_PRIORITY['activity-blink'])
+        self.assertGreater(EFFECT_PRIORITY['activity-blink'], EFFECT_PRIORITY['chase'])
+
+    def test_manual_blink_rejects_lower_priority_breath(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_mode('power', 'on')
+        ctrl.set_effect('power', 'manual-blink')
+        ok, msg = ctrl.set_effect('power', 'breath')
+        self.assertFalse(ok)
+        self.assertIn('priority', msg)
+        self.assertEqual(ctrl.effects['power'], 'manual-blink')
+
+    def test_breath_accepts_higher_priority_manual_blink(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_mode('power', 'on')
+        ctrl.set_effect('power', 'breath')
+        ok, msg = ctrl.set_effect('power', 'manual-blink')
+        self.assertTrue(ok)
+        self.assertEqual(msg, 'OK')
+        self.assertEqual(ctrl.effects['power'], 'manual-blink')
+
+    def test_same_effect_updates_params(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_mode('power', 'on')
+        ctrl.set_effect('power', 'breath', t_on=500, t_off=800)
+        ctrl.run.reset_mock()
+        ok, msg = ctrl.set_effect('power', 'breath', t_on=300, t_off=600)
+        self.assertTrue(ok)
+        self.assertEqual(ctrl.effects['power'], 'breath')
+        self.assertEqual(ctrl.settings['power']['breath_t_on'], 300)
+        self.assertEqual(ctrl.settings['power']['breath_t_off'], 600)
+        ctrl.run.assert_called_once_with(
+            'power', '-breath', '300', '600',
+            '-color', '255', '255', '255', '-brightness', '255')
+
+    def test_activity_does_not_override_manual_blink(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes['disk1'] = 'auto'
+        ctrl._disk_map = {1: 'sda'}
+        ctrl.activity['disk1'] = False
+        ctrl.set_effect('disk1', 'manual-blink')
+        ctrl.run.reset_mock()
+        with patch('pilot_core.disk_present', return_value=True), \
+                patch('pilot_core.read_disk_io', side_effect=[100, 500]):
+            self.assertTrue(ctrl._check_disks())
+        self.assertTrue(ctrl.activity['disk1'])
+        ctrl.run.assert_called_once_with(
+            'disk1', '-on', '-blink', '400', '400',
+            '-color', '255', '255', '255', '-brightness', '255')
+
+    def test_activity_does_not_override_breath(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes['disk1'] = 'auto'
+        ctrl._disk_map = {1: 'sda'}
+        ctrl.activity['disk1'] = False
+        ctrl.set_effect('disk1', 'breath')
+        ctrl.run.reset_mock()
+        with patch('pilot_core.disk_present', return_value=True), \
+                patch('pilot_core.read_disk_io', side_effect=[100, 500]):
+            self.assertTrue(ctrl._check_disks())
+        self.assertTrue(ctrl.activity['disk1'])
+        ctrl.run.assert_called_once_with(
+            'disk1', '-breath', '800', '1200',
+            '-color', '255', '255', '255', '-brightness', '255')
+
+    def test_set_activity_blink_false_keeps_manual_blink(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes['disk1'] = 'auto'
+        ctrl.activity['disk1'] = True
+        ctrl.set_effect('disk1', 'manual-blink')
+        ctrl.run.reset_mock()
+        ok, msg = ctrl.set_activity_blink(False)
+        self.assertTrue(ok)
+        self.assertFalse(ctrl.activity_blink_enabled)
+        self.assertFalse(ctrl.activity['disk1'])
+        ctrl.run.assert_called_once_with(
+            'disk1', '-on', '-blink', '400', '400',
+            '-color', '255', '255', '255', '-brightness', '255')
+
+    def test_set_activity_blink_false_keeps_breath(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes['disk1'] = 'auto'
+        ctrl.activity['disk1'] = True
+        ctrl.set_effect('disk1', 'breath')
+        ctrl.run.reset_mock()
+        ok, msg = ctrl.set_activity_blink(False)
+        self.assertTrue(ok)
+        ctrl.run.assert_called_once_with(
+            'disk1', '-breath', '800', '1200',
+            '-color', '255', '255', '255', '-brightness', '255')
+
+    def test_off_mode_outranks_effect_and_keeps_setting(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_mode('power', 'on')
+        ctrl.set_effect('power', 'manual-blink')
+        ctrl.run.reset_mock()
+        ok, msg = ctrl.set_mode('power', 'off')
+        self.assertTrue(ok)
+        ctrl.run.assert_called_once_with('power', '-off')
+        self.assertEqual(ctrl.effects['power'], 'manual-blink')
+
+    def test_hardware_changed_reapply_keeps_effect(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes = {'power': 'off', 'netdev': 'off', 'disk1': 'auto', 'disk2': 'off'}
+        ctrl._disk_map = {1: 'sda'}
+        ctrl.set_effect('disk1', 'manual-blink')
+        ctrl.run.reset_mock()
+        # simulate LED state lost on remap -> reapply must use the effect,
+        # never demote it to solid-on (activity-blink level)
+        ctrl._last_applied.pop('disk1', None)
+        with patch('pilot_core.detect_disks', return_value={1: 'sda'}), \
+                patch('pilot_core.detect_net_iface', return_value=None), \
+                patch('pilot_core.list_net_ifaces', return_value=[]), \
+                patch('pilot_core.disk_present', return_value=True):
+            ctrl._on_hardware_changed()
+        ctrl.run.assert_called_once_with(
+            'disk1', '-on', '-blink', '400', '400',
+            '-color', '255', '255', '255', '-brightness', '255')
+
+    def test_effect_persists_across_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            settings_file = os.path.join(d, 'led_settings.json')
+            state_file = os.path.join(d, 'led_state.json')
+            run = MagicMock(return_value=(True, '', ''))
+            ctrl = PilotController(['power'], run, state_file, settings_file, disk_count=0)
+            ctrl.set_mode('power', 'on')
+            ctrl.set_effect('power', 'breath', t_on=500, t_off=800)
+            ctrl._flush_settings()
+            # simulate restart: rebuild controller from the same files
+            run2 = MagicMock(return_value=(True, '', ''))
+            ctrl2 = PilotController(['power'], run2, state_file, settings_file, disk_count=0)
+            with patch('pilot_core.detect_disks', return_value={}), \
+                    patch('pilot_core.detect_net_iface', return_value=None), \
+                    patch('pilot_core.list_net_ifaces', return_value=[]):
+                ctrl2.restore_state(apply_hardware=True)
+            self.assertEqual(ctrl2.effects['power'], 'breath')
+            self.assertEqual(ctrl2.settings['power']['breath_t_on'], 500)
+            self.assertEqual(ctrl2.settings['power']['breath_t_off'], 800)
+            self.assertTrue(any(
+                c.args[0] == 'power' and '-breath' in c.args and '500' in c.args
+                for c in run2.call_args_list))
+
+    def test_v210_settings_without_effects_key_loads(self):
+        with tempfile.TemporaryDirectory() as d:
+            settings_file = os.path.join(d, 'led_settings.json')
+            with open(settings_file, 'w') as f:
+                json.dump({'power': {'color': [1, 2, 3], 'brightness': 128}}, f)
+            ctrl = PilotController(
+                ['power'], MagicMock(return_value=(True, '', '')),
+                os.path.join(d, 'led_state.json'), settings_file, disk_count=0)
+            self.assertEqual(ctrl.effects, {})
+            self.assertEqual(ctrl.settings['power']['brightness'], 128)
+            self.assertEqual(ctrl.settings['power']['color'], [1, 2, 3])
+
+    def test_flush_settings_is_additive(self):
+        with tempfile.TemporaryDirectory() as d:
+            settings_file = os.path.join(d, 'led_settings.json')
+            with open(settings_file, 'w') as f:
+                json.dump({'custom_key': 'keep-me'}, f)
+            ctrl = PilotController(
+                ['power'], MagicMock(return_value=(True, '', '')),
+                os.path.join(d, 'led_state.json'), settings_file, disk_count=0)
+            ctrl.set_effect('power', 'manual-blink')
+            ctrl._flush_settings()
+            with open(settings_file) as f:
+                saved = json.load(f)
+            self.assertEqual(saved['custom_key'], 'keep-me')
+            self.assertEqual(saved['effects'], {'power': 'manual-blink'})
 
 
 class TestMultiNicMonitoring(unittest.TestCase):

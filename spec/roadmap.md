@@ -42,6 +42,19 @@
 - [x] 玻璃拟态 UI 重绘
 - [x] 密码长度上限 128 字符
 
+## v2.2 — 效果模式与校准（已完成）
+
+- [x] 效果模式：呼吸（breath）/ 手动闪烁（manual-blink）/ 跑马灯演示（chase，默认关）
+- [x] 效果优先级矩阵（off > on > manual-blink > breath > activity-blink > chase）+ 持久化（additive）
+- [x] 速度感知闪烁（speed-aware blink）
+- [x] 单用户鉴权（admin 固定账号 + 用户名登录 UI）
+- [x] 多网口活动聚合（过滤虚拟网卡）
+- [x] 盘位校准 UI（逐灯识别 + 手动绑定）
+- [x] 性能优化（all-off 单次 CLI 调用、异步 LED 探测、I2C 锁、SSE 竞态防抖）
+- [x] 可靠性修复（E1-E16、RegExp.$1 替换、uevent 线程竞态）
+- [x] CLI pin 上游 commit af2b7ae（可复现构建）
+- [x] 版本 bump v2.2.0 + CI 单元测试 gate
+
 ## 未来计划
 
 - [ ] **定时策略**：夜间自动调暗/关闭 LED

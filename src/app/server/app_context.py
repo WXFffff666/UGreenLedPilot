@@ -12,7 +12,7 @@ from pilot_core import (
 )
 from utils import load_json, save_json
 
-APP_VERSION = '2.1.0'
+APP_VERSION = '2.2.0'
 
 _BUNDLED = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ugreen_leds_cli')
 CLI = _BUNDLED if os.path.exists(_BUNDLED) else '/usr/local/bin/ugreen_leds_cli'

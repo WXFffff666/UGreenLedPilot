@@ -4,7 +4,7 @@
 
 基于 [miskcoo/ugreen_leds_controller](https://github.com/miskcoo/ugreen_leds_controller) 的 `ugreen_leds_cli` 驱动，所有硬件操作均通过该 CLI 完成，无其他控制路径。
 
-**当前版本：v2.1.0** · [下载 Release](https://github.com/WXFffff666/UGreenLedPilot/releases/tag/v2.1.0)
+**当前版本：v2.2.0** · [下载 Release](https://github.com/WXFffff666/UGreenLedPilot/releases/tag/v2.2.0)
 
 ---
 
@@ -22,7 +22,11 @@
 | 手动重映射 | 盘位识别异常时可强制重扫 |
 | 状态持久化 | 重启后自动恢复上次模式 |
 | 实时推送 | SSE 推送状态，无前端轮询 |
-| 安全鉴权 | 登录、CSRF、限流、PBKDF2 密码哈希 |
+| 效果模式 | 呼吸（breath）、手动闪烁（manual-blink）、跑马灯演示（chase，默认关） |
+| 速度感知闪烁 | 自动模式闪烁随磁盘/网络活动速度自适应 |
+| 多网口活动 | 聚合多个物理网口活动（过滤虚拟网卡） |
+| 盘位校准 | 逐灯识别 + 手动绑定盘位（UI 入口） |
+| 安全鉴权 | 单用户登录、CSRF、限流、PBKDF2 密码哈希 |
 
 ---
 
@@ -91,7 +95,7 @@ src/app/server/
 
 ## 安装
 
-1. 从 [Releases](https://github.com/WXFffff666/UGreenLedPilot/releases) 下载 `UGreenLedPilot-2.1.0.x86_64.fpk`
+1. 从 [Releases](https://github.com/WXFffff666/UGreenLedPilot/releases) 下载 `UGreenLedPilot-2.2.0.x86_64.fpk`
 2. 飞牛应用中心 → 手动安装
 3. 打开应用，默认密码 `admin123`（**请立即修改**，至少 8 位，最长 128 位）
 
@@ -105,6 +109,7 @@ src/app/server/
 
 - **全新安装**：data-share 使用新名 `UGreenLedPilot`。
 - **从旧版本升级**：保留旧数据目录 `FnUGreenLed`（不删除、不迁移），升级后应用继续沿用旧数据。
+- **从 v2.1.0 升级**：v2.2 效果设置持久化为 additive（新键），旧配置无效果字段时按默认值正常加载，无需迁移。
 
 ---
 
@@ -159,6 +164,7 @@ src/app/server/
 
 | 版本 | 要点 |
 |------|------|
+| **v2.2.0** | 效果模式（呼吸/手动闪烁/跑马灯演示）；速度感知闪烁；单用户鉴权；多网口活动聚合；盘位校准；性能优化与可靠性修复；玻璃拟态 UI 美化 |
 | **v2.1.0** | netlink uevent 零轮询热插拔；分层监控休眠；活动闪烁可关；玻璃拟态 UI |
 | **v2.0.0** | 模块化重构；SSE 替代轮询；CLI 去重；独立 www 前端 |
 | **v1.1.0** | 模式感知热插拔；DXP4800 Plus 专用；CSRF / 限流 / PBKDF2 |

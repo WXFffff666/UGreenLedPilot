@@ -12,6 +12,17 @@ from uevent_watcher import UeventWatcher
 
 VALID_MODES = ['off', 'on', 'auto']
 VALID_EFFECTS = ['breath', 'manual-blink']
+# Effect priority matrix (F7, Todo 19): when several effect requests target
+# the same LED the highest-priority one wins.
+#   off > on > manual-blink > breath > activity-blink > chase
+#   - off:            mode-level, outranks every effect (checked first in _apply)
+#   - on:             mode-level solid on, the base layer effects refine
+#   - manual-blink:   UI blink effect (-blink 400/400); never demoted once set
+#   - breath:         hardware-native breath; outranks auto activity-blink
+#   - activity-blink: auto-mode IO blink (only effective in 'auto'); yields to
+#                     user effects (manual-blink/breath)
+#   - chase:          demo running light; paused while any activity blinks
+EFFECT_PRIORITY = {'manual-blink': 3, 'breath': 2, 'activity-blink': 1, 'chase': 0}
 MAX_DISK_LEDS = 4
 LED_BASE = ['power', 'netdev']
 LED_STATUS_RE = re.compile(
@@ -409,6 +420,12 @@ class PilotController:
 
     def _load_settings(self):
         saved = load_json(self.settings_file, {})
+        self.effects = {}
+        saved_effects = saved.get('effects') if isinstance(saved, dict) else None
+        if isinstance(saved_effects, dict):
+            for led, effect in saved_effects.items():
+                if led in self.leds and effect in VALID_EFFECTS:
+                    self.effects[led] = effect
         settings = {}
         for led in self.leds:
             base = dict(DEFAULT_SETTINGS.get(led, {'color': list(WHITE), 'brightness': 255}))
@@ -428,7 +445,14 @@ class PilotController:
     def _flush_settings(self):
         with self._lock:
             if self._settings_dirty:
-                save_json(self.settings_file, self.settings)
+                # additive-only: never drop top-level keys written by other
+                # features (e.g. upgrade from v2.1.0 files without 'effects')
+                saved = load_json(self.settings_file, {})
+                if not isinstance(saved, dict):
+                    saved = {}
+                saved.update(self.settings)
+                saved['effects'] = dict(self.effects)
+                save_json(self.settings_file, saved)
                 self._settings_dirty = False
 
     def get_settings(self, led):
@@ -480,14 +504,19 @@ class PilotController:
             if effect is None:
                 self.effects.pop(led, None)
             else:
+                current = self.effects.get(led)
+                if current is not None and EFFECT_PRIORITY[effect] < EFFECT_PRIORITY[current]:
+                    # priority matrix (F7, Todo 19): never demote the active
+                    # effect with a lower-priority one (e.g. breath onto
+                    # manual-blink). Same effect still updates its parameters.
+                    return False, (f'Rejected {effect}: {current} has higher priority')
                 self.effects[led] = effect
+            self._schedule_settings_save()
             if effect == 'breath':
                 if t_on is not None:
                     self.settings.setdefault(led, {})['breath_t_on'] = max(0, int(t_on))
-                    self._schedule_settings_save()
                 if t_off is not None:
                     self.settings.setdefault(led, {})['breath_t_off'] = max(0, int(t_off))
-                    self._schedule_settings_save()
             mode = self.modes.get(led, 'off')
             if mode != 'off':
                 ok, err = self._apply(led, mode, self.activity.get(led, False))
@@ -568,6 +597,9 @@ class PilotController:
                     if self.activity.get(led):
                         self.activity[led] = False
                         if self.modes.get(led) == 'auto':
+                            # priority matrix (F7, Todo 19): reapply through
+                            # _apply so user effects (manual-blink/breath) are
+                            # kept — only the activity-blink state is reset
                             self._apply(led, 'auto', activity=False)
             self._sync_watchers()
             self._wake_monitor()
@@ -706,6 +738,9 @@ class PilotController:
             return True, 'OK'
 
     def _apply(self, led, mode, activity=False, blink_params=None):
+        # priority matrix (F7, Todo 19): mode 'off' outranks every effect and
+        # user effects (manual-blink/breath) outrank auto activity-blink —
+        # both are enforced by the branch order below
         effect = self.effects.get(led)
         t_on = t_off = None
         if effect == 'breath':
@@ -816,6 +851,8 @@ class PilotController:
                 self._apply(led, 'auto', activity=False)
                 continue
             if mode == 'auto':
+                # reapply via _apply: user effects (manual-blink/breath)
+                # outrank activity-blink and survive the remap (F7, Todo 19)
                 self._apply(led, 'auto', self.activity.get(led, False))
 
         for slot, dev in self._disk_map.items():
