@@ -61,6 +61,7 @@ class AppContext:
             disk_count=self.disk_count,
             broadcaster=self.broadcaster,
             activity_blink=self.cfg.get('activity_blink', True),
+            bay_bindings=self.cfg.get('bay_bindings', {}),
         )
         self.ctrl.restore_state(hardware_modes=self.hardware_modes, apply_hardware=True)
         self.ctrl.start_monitor()
@@ -112,6 +113,7 @@ class AppContext:
             ata_map=self.cfg['ata_map'], hctl_map=self.cfg['hctl_map'],
             disk_count=self.disk_count, broadcaster=self.broadcaster,
             activity_blink=self.cfg.get('activity_blink', True),
+            bay_bindings=self.cfg.get('bay_bindings', {}),
         )
         self.ctrl.restore_state(apply_hardware=True)
         self.ctrl.start_monitor()

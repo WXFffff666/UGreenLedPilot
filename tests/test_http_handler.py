@@ -19,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src' / 'app' / 'se
 
 from auth_manager import AuthManager, MAX_LOGIN_ATTEMPTS
 from http_handler import PilotHandler, _header_host, MAX_BODY_BYTES
+from pilot_core import PilotController
+from utils import save_json
 
 
 class _HandlerMixin:
@@ -28,6 +30,7 @@ class _HandlerMixin:
         self.dir = tempfile.mkdtemp()
         self.auth = AuthManager(os.path.join(self.dir, 'auth.json'))
         self.ctrl = MagicMock()
+        self.ctrl.disk_count = 4
         self.ctrl.set_mode.return_value = (True, 'OK')
         self.ctrl.set_color.return_value = (True, 'OK')
         self.ctrl.set_brightness.return_value = (True, 'OK')
@@ -396,6 +399,137 @@ class TestRequestBody(_HandlerMixin, unittest.TestCase):
         handler = self.make_handler(path='/api/nope', headers=self.auth_headers())
         self.post_json(handler, {})
         self.assertEqual(handler._responses[-1][0], 404)
+
+
+class TestCalibrate(_HandlerMixin, unittest.TestCase):
+    """F8 (Todo 20): 盘位校准 — identify blink + manual bind, persisted."""
+
+    FAKE_DEVICES = {
+        'sda': {'hctl': '0:0:0:0', 'ata': None, 'serial': ''},
+        'sdb': {'hctl': '1:0:0:0', 'ata': None, 'serial': ''},
+        'sdc': {'hctl': '2:0:0:0', 'ata': None, 'serial': ''},
+        'sdd': {'hctl': '3:0:0:0', 'ata': None, 'serial': ''},
+    }
+
+    def make_controller(self, bay_bindings=None):
+        return PilotController(
+            ['power', 'netdev', 'disk1', 'disk2', 'disk3', 'disk4'],
+            run=MagicMock(return_value=(True, '', '')),
+            state_file=os.path.join(self.dir, 'led_state.json'),
+            settings_file=os.path.join(self.dir, 'led_settings.json'),
+            disk_count=4,
+            bay_bindings=bay_bindings,
+        )
+
+    def test_identify_valid_led_blinks(self):
+        self.ctrl.get_settings.return_value = {'color': [255, 255, 255], 'brightness': 255}
+        self.ctrl.run.return_value = (True, '', '')
+        handler = self.make_handler(
+            path='/api/calibrate/identify', headers=self.auth_headers())
+        self.post_json(handler, {'led': 'disk1'})
+        status, body = handler._responses[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(body['success'])
+        self.ctrl.run.assert_called_once()
+        args = self.ctrl.run.call_args[0]
+        self.assertIn('disk1', args)
+        self.assertIn('-blink', args)
+
+    def test_identify_invalid_led_400(self):
+        handler = self.make_handler(
+            path='/api/calibrate/identify', headers=self.auth_headers())
+        self.post_json(handler, {'led': 'disk9'})
+        status, body = handler._responses[-1]
+        self.assertEqual(status, 400)
+        self.assertFalse(body['success'])
+        self.ctrl.run.assert_not_called()
+
+    def test_bind_valid_hctl_200_and_persisted(self):
+        cfg_path = os.path.join(self.dir, 'device_config.json')
+        with patch('http_handler.CONFIG_FILE', cfg_path):
+            handler = self.make_handler(
+                path='/api/calibrate/bind', headers=self.auth_headers())
+            handler.app.cfg = {'bay_bindings': {}}
+            self.post_json(handler, {'slot': 'disk1', 'hctl': '2:0:0:0'})
+            status, body = handler._responses[-1]
+            self.assertEqual(status, 200)
+            self.assertTrue(body['success'])
+            with open(cfg_path, encoding='utf-8') as f:
+                saved = json.load(f)
+            self.assertEqual(saved['bay_bindings'], {'disk1': '2:0:0:0'})
+            # other keys survive (additive-only)
+            self.assertIn('bay_bindings', saved)
+            self.ctrl.set_bay_bindings.assert_called_once_with({'disk1': '2:0:0:0'})
+
+    def test_bind_invalid_hctl_400(self):
+        handler = self.make_handler(
+            path='/api/calibrate/bind', headers=self.auth_headers())
+        handler.app.cfg = {'bay_bindings': {}}
+        self.post_json(handler, {'slot': 'disk1', 'hctl': 'not-a-hctl'})
+        status, body = handler._responses[-1]
+        self.assertEqual(status, 400)
+        self.assertFalse(body['success'])
+
+    def test_bind_invalid_slot_400(self):
+        handler = self.make_handler(
+            path='/api/calibrate/bind', headers=self.auth_headers())
+        handler.app.cfg = {'bay_bindings': {}}
+        self.post_json(handler, {'slot': 'disk9', 'hctl': '0:0:0:0'})
+        self.assertEqual(handler._responses[-1][0], 400)
+
+    def test_remap_uses_bay_bindings(self):
+        with patch('pilot_core.collect_block_devices',
+                   return_value=dict(self.FAKE_DEVICES)):
+            ctrl = self.make_controller(bay_bindings={'disk1': '3:0:0:0'})
+            ctrl.restore_state(apply_hardware=False)
+        # bound slot 1 -> 3:0:0:0 (sdd); unbound slots keep default map
+        self.assertEqual(ctrl._disk_map, {1: 'sdd', 2: 'sdb', 3: 'sdc', 4: 'sdd'})
+
+    def test_force_remap_applies_runtime_bindings(self):
+        # bindings saved after boot (via API) must apply on force_remap
+        with patch('pilot_core.collect_block_devices',
+                   return_value=dict(self.FAKE_DEVICES)):
+            ctrl = self.make_controller()
+            ctrl.set_bay_bindings({'disk2': '0:0:0:0'})
+            ok, _ = ctrl.force_remap()
+        self.assertTrue(ok)
+        self.assertEqual(ctrl._disk_map[1], 'sda')
+        self.assertEqual(ctrl._disk_map[2], 'sda')
+        self.assertEqual(ctrl._disk_map[3], 'sdc')
+
+    def test_reset_removes_bay_bindings(self):
+        cfg_path = os.path.join(self.dir, 'device_config.json')
+        with patch('http_handler.CONFIG_FILE', cfg_path), \
+                patch('app_context.STATE_FILE',
+                      os.path.join(self.dir, 'led_state.json')), \
+                patch('app_context.SETTINGS_FILE',
+                      os.path.join(self.dir, 'led_settings.json')):
+            # a prior bind persisted bay_bindings
+            handler = self.make_handler(
+                path='/api/calibrate/bind', headers=self.auth_headers())
+            handler.app.cfg = {'bay_bindings': {}}
+            self.post_json(handler, {'slot': 'disk1', 'hctl': '2:0:0:0'})
+            with open(cfg_path, encoding='utf-8') as f:
+                self.assertIn('bay_bindings', json.load(f))
+
+            # reset rebuilds the default config without bay_bindings
+            handler = self.make_handler(
+                path='/api/reset', headers=self.auth_headers())
+
+            def fake_reset_controller():
+                save_json(cfg_path, {
+                    'disk_count': 4, 'model': 'dxp4800plus',
+                    'model_name': 'DXP4800 Plus', 'product_name': '',
+                    'auto_detected': True,
+                    'ata_map': ['ata1', 'ata2', 'ata3', 'ata4'],
+                    'hctl_map': ['0:0:0:0', '1:0:0:0', '2:0:0:0', '3:0:0:0'],
+                    'activity_blink': True,
+                })
+            handler.app.reset_controller = fake_reset_controller
+            self.post_json(handler, {})
+            with open(cfg_path, encoding='utf-8') as f:
+                saved = json.load(f)
+            self.assertNotIn('bay_bindings', saved)
 
 
 if __name__ == '__main__':

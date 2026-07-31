@@ -373,13 +373,14 @@ class PilotController:
 
     def __init__(self, led_names, run, state_file, settings_file,
                  ata_map=None, hctl_map=None, disk_count=4, broadcaster=None,
-                 activity_blink=True, speed_blink=False):
+                 activity_blink=True, speed_blink=False, bay_bindings=None):
         self.leds = led_names
         self.run = run
         self.state_file = state_file
         self.settings_file = settings_file
         self.ata_map = ata_map or DXP4800_PLUS_PROFILE['ata_map']
         self.hctl_map = hctl_map or DXP4800_PLUS_PROFILE['hctl_map']
+        self.bay_bindings = dict(bay_bindings or {})
         self.disk_count = min(disk_count, MAX_DISK_LEDS)
         self.broadcaster = broadcaster or StatusBroadcaster()
         self.activity_blink_enabled = bool(activity_blink)
@@ -433,6 +434,34 @@ class PilotController:
                 base.update(saved[led])
             settings[led] = base
         return settings
+
+    @staticmethod
+    def _bay_slot(key):
+        """Slot number from a bay_bindings key ('disk1' / '1' / 1) or None."""
+        if isinstance(key, int):
+            return key
+        m = re.match(r'^disk(\d+)$', str(key))
+        if m:
+            return int(m.group(1))
+        try:
+            return int(str(key))
+        except ValueError:
+            return None
+
+    def _merged_hctl_map(self):
+        """hctl_map with bay_bindings applied (bound slots win, others default)."""
+        merged = list(self.hctl_map)
+        for key, hctl in self.bay_bindings.items():
+            slot = self._bay_slot(key)
+            if slot is not None and 1 <= slot <= len(merged):
+                merged[slot - 1] = str(hctl)
+        return merged
+
+    def set_bay_bindings(self, bindings):
+        """Replace the slot -> hctl bay-binding map; applies on next remap/scan."""
+        with self._lock:
+            self.bay_bindings = dict(bindings or {})
+        return True, 'OK'
 
     def _schedule_settings_save(self):
         self._settings_dirty = True
@@ -683,7 +712,7 @@ class PilotController:
         hardware_modes = hardware_modes or {}
         with self._lock:
             saved = load_json(self.state_file, {})
-            self._disk_map = detect_disks(self.ata_map, self.hctl_map, self.disk_count)
+            self._disk_map = detect_disks(self.ata_map, self._merged_hctl_map(), self.disk_count)
             self._net_iface = detect_net_iface()
             self._net_ifaces = list_net_ifaces()
             self._refresh_signatures()
@@ -803,7 +832,7 @@ class PilotController:
 
     def start_monitor(self):
         with self._lock:
-            self._disk_map = detect_disks(self.ata_map, self.hctl_map, self.disk_count)
+            self._disk_map = detect_disks(self.ata_map, self._merged_hctl_map(), self.disk_count)
             self._net_iface = detect_net_iface()
             self._net_ifaces = list_net_ifaces()
             self._refresh_signatures()
@@ -836,7 +865,7 @@ class PilotController:
 
     def _on_hardware_changed(self):
         old_map = dict(self._disk_map)
-        self._disk_map = detect_disks(self.ata_map, self.hctl_map, self.disk_count)
+        self._disk_map = detect_disks(self.ata_map, self._merged_hctl_map(), self.disk_count)
         self._net_iface = detect_net_iface()
         self._net_ifaces = list_net_ifaces()
         self._update_presence()

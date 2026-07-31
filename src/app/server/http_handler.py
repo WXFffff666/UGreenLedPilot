@@ -7,16 +7,21 @@ import re
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import unquote, urlparse
 
-from app_context import APP_VERSION, WWW_DIR
-from pilot_core import VALID_MODES
+from app_context import APP_VERSION, CONFIG_FILE, WWW_DIR
+from pilot_core import VALID_MODES, MANUAL_BLINK_ON_MS, MANUAL_BLINK_OFF_MS
 from utils import remove_file, save_json
 
 MAX_BODY_BYTES = 65536
 LED_NAME_RE = re.compile(r'^(power|netdev|disk[1-4])$')
+HCTL_RE = re.compile(r'^\d+:\d+:\d+:\d+$')
 
 
 def validate_led(led):
     return bool(led and LED_NAME_RE.match(led))
+
+
+def validate_hctl(hctl):
+    return bool(hctl and HCTL_RE.match(hctl))
 
 
 def validate_mode(mode):
@@ -140,6 +145,8 @@ class PilotHandler(BaseHTTPRequestHandler):
             '/api/change-password': lambda: self._change_password(data),
             '/api/remap': self._remap,
             '/api/activity-blink': lambda: self._activity_blink(data),
+            '/api/calibrate/identify': lambda: self._calibrate_identify(data),
+            '/api/calibrate/bind': lambda: self._calibrate_bind(data),
             '/api/all/off': lambda: self._all('off'),
             '/api/all/on': lambda: self._all('on'),
             '/api/all/auto': lambda: self._all('auto'),
@@ -304,6 +311,47 @@ class PilotHandler(BaseHTTPRequestHandler):
             'success': ok, 'message': msg,
             'disk_map': self.app.ctrl.get_status().get('disk_map', {}),
         })
+
+    def _calibrate_identify(self, data):
+        """F8 (Todo 20): blink the given LED so the user can locate the bay."""
+        led = data.get('led', '')
+        if not validate_led(led):
+            return self._json(400, {'success': False, 'message': '无效 LED'})
+        cfg = self.app.ctrl.get_settings(led)
+        cr, cg, cb = map(str, cfg['color'])
+        brightness = str(cfg['brightness'])
+        ok, _, err = self.app.ctrl.run(
+            led, '-on', '-blink', str(MANUAL_BLINK_ON_MS), str(MANUAL_BLINK_OFF_MS),
+            '-color', cr, cg, cb, '-brightness', brightness,
+        )
+        if not ok:
+            return self._json(500, {'success': False, 'message': err or '识别失败'})
+        return self._json(200, {'success': True, 'message': '识别中'})
+
+    def _calibrate_bind(self, data):
+        """F8 (Todo 20): persist a manual slot -> hctl bay binding."""
+        slot, hctl = data.get('slot', ''), data.get('hctl', '')
+        if isinstance(slot, str) and slot.startswith('disk'):
+            try:
+                slot_num = int(slot[len('disk'):])
+            except ValueError:
+                return self._json(400, {'success': False, 'message': '无效盘位'})
+        else:
+            try:
+                slot_num = int(slot)
+            except (TypeError, ValueError):
+                return self._json(400, {'success': False, 'message': '无效盘位'})
+        if not (1 <= slot_num <= self.app.ctrl.disk_count):
+            return self._json(400, {'success': False, 'message': '无效盘位'})
+        if not validate_hctl(hctl):
+            return self._json(400, {'success': False, 'message': '无效 HCTL'})
+        key = f'disk{slot_num}'
+        cfg = self.app.cfg
+        cfg.setdefault('bay_bindings', {})
+        cfg['bay_bindings'][key] = hctl
+        save_json(CONFIG_FILE, cfg)
+        self.app.ctrl.set_bay_bindings(cfg['bay_bindings'])
+        return self._json(200, {'success': True, 'message': f'盘位 {slot_num} 已绑定 {hctl}'})
 
     def _reset_config(self):
         from app_context import SETTINGS_FILE, STATE_FILE
