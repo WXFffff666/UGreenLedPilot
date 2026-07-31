@@ -273,7 +273,7 @@ class TestBreathEffect(unittest.TestCase):
         ctrl.run.reset_mock()
         ctrl.set_effect('power', 'manual-blink')
         ctrl.run.assert_called_once_with(
-            'power', '-on', '-blink', '80', '120',
+            'power', '-on', '-blink', '400', '400',
             '-color', '255', '255', '255', '-brightness', '255')
 
     def test_invalid_effect_rejected(self):
@@ -281,6 +281,39 @@ class TestBreathEffect(unittest.TestCase):
         ok, msg = ctrl.set_effect('power', 'chase')
         self.assertFalse(ok)
         self.assertIn('Invalid effect', msg)
+
+
+class TestManualBlinkEffect(unittest.TestCase):
+    """F7b (Todo 17): manual blink as a standalone effect (400/400 ms)."""
+
+    def _make_ctrl(self):
+        run = MagicMock(return_value=(True, '', ''))
+        return PilotController(
+            ['power', 'netdev', 'disk1', 'disk2'],
+            run, '/tmp/test_state.json', '/tmp/test_settings.json',
+            disk_count=2,
+        )
+
+    def test_manual_blink_cli_full_args(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_mode('power', 'on')
+        ctrl.set_effect('power', 'manual-blink')
+        ctrl.run.reset_mock()
+        ok, msg = ctrl.set_color('power', 0, 0, 255)
+        self.assertTrue(ok)
+        ctrl.run.assert_called_once_with(
+            'power', '-on', '-blink', '400', '400',
+            '-color', '0', '0', '255', '-brightness', '255')
+
+    def test_manual_blink_to_off_calls_off(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_mode('power', 'on')
+        ctrl.set_effect('power', 'manual-blink')
+        ctrl.run.reset_mock()
+        ok, msg = ctrl.set_mode('power', 'off')
+        self.assertTrue(ok)
+        self.assertEqual(msg, 'OK')
+        ctrl.run.assert_called_once_with('power', '-off')
 
 
 class TestDiskIoCounterReset(unittest.TestCase):
@@ -326,6 +359,123 @@ class TestDiskIoCounterReset(unittest.TestCase):
         with patch('pilot_core.disk_present', return_value=False):
             self.assertFalse(ctrl._check_disks())
         self.assertNotIn(1, ctrl._prev_disk_io)
+
+
+class TestSpeedAwareBlink(unittest.TestCase):
+    """F7b (Todo 17): rate-tiered blink — steady on / 400ms / 100ms by bytes-per-s."""
+
+    def _make_ctrl(self, speed_blink=True):
+        run = MagicMock(return_value=(True, '', ''))
+        return PilotController(
+            ['power', 'netdev', 'disk1', 'disk2'],
+            run, '/tmp/test_state.json', '/tmp/test_settings.json',
+            disk_count=2, speed_blink=speed_blink,
+        )
+
+    def _seed_net(self, ctrl):
+        ctrl.modes['netdev'] = 'auto'
+        ctrl._net_iface = 'eth0'
+        ctrl._net_ifaces = ['eth0']
+        ctrl._prev_net_rx = {'eth0': 100000}
+        ctrl._prev_net_tx = {'eth0': 0}
+        ctrl._last_net_check = time.monotonic() - 1.0
+        ctrl.activity['netdev'] = False
+
+    def test_speed_blink_default_off(self):
+        ctrl = self._make_ctrl(speed_blink=False)
+        self.assertFalse(ctrl.speed_blink_enabled)
+
+    def test_low_rate_below_100k_stays_on(self):
+        ctrl = self._make_ctrl()
+        self._seed_net(ctrl)
+        # 30KB/s in 1s — below 100KB/s → steady on, no -blink
+        with patch('pilot_core.read_stats', side_effect=[130000, 0]):
+            self.assertTrue(ctrl._check_network())
+        ctrl.run.assert_called_once_with(
+            'netdev', '-on', '-color', '255', '165', '0', '-brightness', '255')
+
+    def test_mid_rate_uses_400_400(self):
+        ctrl = self._make_ctrl()
+        self._seed_net(ctrl)
+        # 500KB/s in 1s → 400/400
+        with patch('pilot_core.read_stats', side_effect=[600000, 0]):
+            self.assertTrue(ctrl._check_network())
+        ctrl.run.assert_called_once_with(
+            'netdev', '-on', '-blink', '400', '400',
+            '-color', '255', '165', '0', '-brightness', '255')
+
+    def test_high_rate_uses_100_100(self):
+        ctrl = self._make_ctrl()
+        self._seed_net(ctrl)
+        # 2.4MB/s in 1s → 100/100
+        with patch('pilot_core.read_stats', side_effect=[2500000, 0]):
+            self.assertTrue(ctrl._check_network())
+        ctrl.run.assert_called_once_with(
+            'netdev', '-on', '-blink', '100', '100',
+            '-color', '255', '165', '0', '-brightness', '255')
+
+    def test_rate_tier_change_retriggers_cli(self):
+        ctrl = self._make_ctrl()
+        self._seed_net(ctrl)
+        with patch('pilot_core.read_stats', side_effect=[600000, 0]):
+            ctrl._check_network()  # 500KB/s → 400/400
+        ctrl.run.reset_mock()
+        ctrl._last_net_check = time.monotonic() - 1.0
+        with patch('pilot_core.read_stats', side_effect=[2500000, 0]):
+            self.assertTrue(ctrl._check_network())  # 2.4MB/s → 100/100
+        ctrl.run.assert_called_once_with(
+            'netdev', '-on', '-blink', '100', '100',
+            '-color', '255', '165', '0', '-brightness', '255')
+
+    def test_same_rate_tier_deduped(self):
+        ctrl = self._make_ctrl()
+        self._seed_net(ctrl)
+        with patch('pilot_core.read_stats', side_effect=[600000, 0]):
+            ctrl._check_network()  # 500KB/s → 400/400
+        ctrl.run.reset_mock()
+        ctrl._last_net_check = time.monotonic() - 1.0
+        with patch('pilot_core.read_stats', side_effect=[1150000, 0]):
+            self.assertFalse(ctrl._check_network())  # 550KB/s → still 400/400
+        ctrl.run.assert_not_called()
+
+    def test_speed_blink_disabled_keeps_fixed_blink(self):
+        ctrl = self._make_ctrl(speed_blink=False)
+        self._seed_net(ctrl)
+        with patch('pilot_core.read_stats', side_effect=[600000, 0]):
+            self.assertTrue(ctrl._check_network())
+        ctrl.run.assert_called_once_with(
+            'netdev', '-on', '-blink', '80', '120',
+            '-color', '255', '165', '0', '-brightness', '255')
+
+    def test_disk_rate_tier_uses_blink(self):
+        ctrl = self._make_ctrl()
+        ctrl._disk_map = {1: 'sda'}
+        ctrl.modes['disk1'] = 'auto'
+        ctrl.activity['disk1'] = False
+        ctrl._prev_disk_io[1] = 100000
+        ctrl._last_disk_check[1] = time.monotonic() - 1.0
+        # 500KB/s in 1s → 400/400
+        with patch('pilot_core.disk_present', return_value=True), \
+                patch('pilot_core.read_disk_io', side_effect=[600000]):
+            self.assertTrue(ctrl._check_disks())
+        ctrl.run.assert_called_once_with(
+            'disk1', '-on', '-blink', '400', '400',
+            '-color', '255', '255', '255', '-brightness', '255')
+
+    def test_set_speed_blink_disable_reapplies_fixed_blink(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes['netdev'] = 'auto'
+        ctrl.activity['netdev'] = True
+        ctrl._net_iface = 'eth0'
+        ctrl._net_ifaces = ['eth0']
+        ctrl._apply('netdev', 'auto', activity=True, blink_params=(400, 400))
+        ctrl.run.reset_mock()
+        ok, msg = ctrl.set_speed_blink(False)
+        self.assertTrue(ok)
+        self.assertFalse(ctrl.speed_blink_enabled)
+        ctrl.run.assert_called_once_with(
+            'netdev', '-on', '-blink', '80', '120',
+            '-color', '255', '165', '0', '-brightness', '255')
 
 
 class TestMultiNicMonitoring(unittest.TestCase):

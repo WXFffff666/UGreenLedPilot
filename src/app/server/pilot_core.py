@@ -30,8 +30,16 @@ DXP4800_PLUS_PROFILE = {
 
 BLINK_ON_MS = 80
 BLINK_OFF_MS = 120
+MANUAL_BLINK_ON_MS = 400
+MANUAL_BLINK_OFF_MS = 400
 BREATH_ON_MS = 800
 BREATH_OFF_MS = 1200
+SPEED_BLINK_LOW_RATE = 100_000      # bytes/s — below: steady on
+SPEED_BLINK_HIGH_RATE = 1_000_000   # bytes/s — at or above: fast blink
+SPEED_BLINK_MID_ON_MS = 400
+SPEED_BLINK_MID_OFF_MS = 400
+SPEED_BLINK_FAST_ON_MS = 100
+SPEED_BLINK_FAST_OFF_MS = 100
 ACTIVITY_IO_THRESHOLD = 1
 SETTINGS_SAVE_DELAY = 0.8
 ACTIVITY_FAST_INTERVAL = 0.5
@@ -353,7 +361,7 @@ class PilotController:
 
     def __init__(self, led_names, run, state_file, settings_file,
                  ata_map=None, hctl_map=None, disk_count=4, broadcaster=None,
-                 activity_blink=True):
+                 activity_blink=True, speed_blink=False):
         self.leds = led_names
         self.run = run
         self.state_file = state_file
@@ -363,6 +371,7 @@ class PilotController:
         self.disk_count = min(disk_count, MAX_DISK_LEDS)
         self.broadcaster = broadcaster or StatusBroadcaster()
         self.activity_blink_enabled = bool(activity_blink)
+        self.speed_blink_enabled = bool(speed_blink)
         self.modes = {}
         self.activity = {}
         self.effects = {}
@@ -374,6 +383,8 @@ class PilotController:
         self._prev_net_rx = {}
         self._prev_net_tx = {}
         self._prev_disk_io = {}
+        self._last_net_check = None
+        self._last_disk_check = {}
         self._disk_sig = None
         self._net_sig = None
         self._last_applied = {}
@@ -552,6 +563,17 @@ class PilotController:
             self._notify()
             return True, 'OK'
 
+    def set_speed_blink(self, enabled):
+        """Toggle rate-aware blink (independent of activity_blink)."""
+        with self._lock:
+            self.speed_blink_enabled = bool(enabled)
+            if not enabled:
+                for led in self.leds:
+                    if self.modes.get(led) == 'auto' and self.activity.get(led):
+                        self._apply(led, 'auto', activity=True)
+            self._notify()
+            return True, 'OK'
+
     def _is_present(self, led):
         if led == 'power':
             return True
@@ -572,12 +594,14 @@ class PilotController:
         self._disk_sig = disk_signature()
         self._net_sig = net_signature()
 
-    def _apply_key(self, led, mode, activity, effect=None, t_on=None, t_off=None):
+    def _apply_key(self, led, mode, activity, effect=None, t_on=None, t_off=None,
+                   blink_params=None):
         cfg = self.get_settings(led)
         if effect == 'breath':
             return (mode, activity, effect, t_on, t_off,
                     tuple(cfg['color']), cfg['brightness'])
-        return (mode, activity, effect, tuple(cfg['color']), cfg['brightness'])
+        return (mode, activity, effect, blink_params,
+                tuple(cfg['color']), cfg['brightness'])
 
     def restore_state(self, hardware_modes=None, apply_hardware=True):
         hardware_modes = hardware_modes or {}
@@ -634,14 +658,14 @@ class PilotController:
             self._notify()
             return True, 'OK'
 
-    def _apply(self, led, mode, activity=False):
+    def _apply(self, led, mode, activity=False, blink_params=None):
         effect = self.effects.get(led)
         t_on = t_off = None
         if effect == 'breath':
             cfg0 = self.get_settings(led)
             t_on = cfg0.get('breath_t_on', BREATH_ON_MS)
             t_off = cfg0.get('breath_t_off', BREATH_OFF_MS)
-        key = self._apply_key(led, mode, activity, effect, t_on, t_off)
+        key = self._apply_key(led, mode, activity, effect, t_on, t_off, blink_params)
         if self._last_applied.get(led) == key:
             return True, 'OK'
 
@@ -658,7 +682,7 @@ class PilotController:
             )
         elif effect == 'manual-blink':
             ok, _, err = self.run(
-                led, '-on', '-blink', str(BLINK_ON_MS), str(BLINK_OFF_MS),
+                led, '-on', '-blink', str(MANUAL_BLINK_ON_MS), str(MANUAL_BLINK_OFF_MS),
                 '-color', cr, cg, cb, '-brightness', brightness,
             )
         elif mode == 'on':
@@ -666,10 +690,19 @@ class PilotController:
         elif not self._is_present(led):
             ok, _, err = self.run(led, '-off')
         elif activity:
-            ok, _, err = self.run(
-                led, '-on', '-blink', str(BLINK_ON_MS), str(BLINK_OFF_MS),
-                '-color', cr, cg, cb, '-brightness', brightness,
-            )
+            if blink_params is not None:
+                ok, _, err = self.run(
+                    led, '-on', '-blink', str(blink_params[0]), str(blink_params[1]),
+                    '-color', cr, cg, cb, '-brightness', brightness,
+                )
+            elif self.speed_blink_enabled:
+                # speed-aware: rate below low threshold → steady on
+                ok, _, err = self.run(led, '-on', '-color', cr, cg, cb, '-brightness', brightness)
+            else:
+                ok, _, err = self.run(
+                    led, '-on', '-blink', str(BLINK_ON_MS), str(BLINK_OFF_MS),
+                    '-color', cr, cg, cb, '-brightness', brightness,
+                )
         else:
             ok, _, err = self.run(led, '-on', '-color', cr, cg, cb, '-brightness', brightness)
 
@@ -815,6 +848,14 @@ class PilotController:
             if self._wake_event.wait(timeout=interval):
                 self._wake_event.clear()
 
+    def _blink_for_rate(self, rate):
+        """Map bytes/s to blink timing in ms; None → steady on (speed-aware)."""
+        if rate < SPEED_BLINK_LOW_RATE:
+            return None
+        if rate < SPEED_BLINK_HIGH_RATE:
+            return (SPEED_BLINK_MID_ON_MS, SPEED_BLINK_MID_OFF_MS)
+        return (SPEED_BLINK_FAST_ON_MS, SPEED_BLINK_FAST_OFF_MS)
+
     def _check_network(self):
         led = 'netdev'
         if self.modes.get(led) != 'auto':
@@ -835,10 +876,22 @@ class PilotController:
             self._prev_net_rx[iface] = rx
             self._prev_net_tx[iface] = tx
         active = delta >= ACTIVITY_IO_THRESHOLD
+        blink_params = None
+        if self.speed_blink_enabled and self.effects.get(led) is None:
+            now = time.monotonic()
+            elapsed = (now - self._last_net_check) if self._last_net_check else 0.0
+            self._last_net_check = now
+            if elapsed > 0:
+                blink_params = self._blink_for_rate(delta / elapsed)
         if active != self.activity.get(led):
             self.activity[led] = active
-            self._apply(led, 'auto', activity=active)
+            self._apply(led, 'auto', activity=active, blink_params=blink_params)
             return True
+        if self.speed_blink_enabled and self.effects.get(led) is None:
+            key = self._apply_key(led, 'auto', active, None, None, None, blink_params)
+            if key != self._last_applied.get(led):
+                self._apply(led, 'auto', activity=active, blink_params=blink_params)
+                return True
         return False
 
     def _check_disks(self):
@@ -855,6 +908,7 @@ class PilotController:
                     self._apply(led, 'auto', activity=False)
                     changed = True
                 self._prev_disk_io.pop(slot, None)
+                self._last_disk_check.pop(slot, None)
                 continue
             self.presence[led] = True
             io = read_disk_io(f'/sys/block/{dev}/stat')
@@ -862,10 +916,23 @@ class PilotController:
             delta = io - prev if io >= prev else 0
             active = delta >= ACTIVITY_IO_THRESHOLD
             self._prev_disk_io[slot] = io
+            blink_params = None
+            if self.speed_blink_enabled and self.effects.get(led) is None:
+                now = time.monotonic()
+                elapsed = now - self._last_disk_check.get(slot, now)
+                self._last_disk_check[slot] = now
+                if elapsed > 0:
+                    blink_params = self._blink_for_rate(delta / elapsed)
             if active != self.activity.get(led):
                 self.activity[led] = active
-                self._apply(led, 'auto', activity=active)
+                self._apply(led, 'auto', activity=active, blink_params=blink_params)
                 changed = True
+                continue
+            if self.speed_blink_enabled and self.effects.get(led) is None:
+                key = self._apply_key(led, 'auto', active, None, None, None, blink_params)
+                if key != self._last_applied.get(led):
+                    self._apply(led, 'auto', activity=active, blink_params=blink_params)
+                    changed = True
         return changed
 
     def get_live_status(self):
@@ -880,6 +947,7 @@ class PilotController:
                 'hotplug_monitor': self.needs_hotplug_monitor(),
                 'monitor_tier': self._monitor_tier(),
                 'activity_blink': self.activity_blink_enabled,
+                'speed_blink': self.speed_blink_enabled,
                 'uevent_available': self._uevent.available,
                 'rescan_count': self._rescan_count,
             }
@@ -899,6 +967,7 @@ class PilotController:
                 'hotplug_monitor': self.needs_hotplug_monitor(),
                 'monitor_tier': self._monitor_tier(),
                 'activity_blink': self.activity_blink_enabled,
+                'speed_blink': self.speed_blink_enabled,
                 'uevent_available': self._uevent.available,
                 'rescan_count': self._rescan_count,
                 'model': DXP4800_PLUS_PROFILE,

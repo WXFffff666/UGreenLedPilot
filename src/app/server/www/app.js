@@ -10,6 +10,8 @@
   let leds = [];
   let presets = [];
   let eventSource = null;
+  // E15: led → 最近一次本地操作时间戳(ms)，SSE 合并 modes 时跳过保护窗内的盘位，避免旧帧回跳
+  let lastLocalTouch = {};
 
   function api(method, path, body) {
     const opts = {
@@ -75,12 +77,26 @@
     if (bay) bay.classList.toggle('active', mode !== 'off');
   }
 
-  function applyStatus(data) {
+  function applyStatus(data, src) {
     if (data.csrf_token) csrf = data.csrf_token;
     if (data.presets) presets = data.presets;
     if (data.settings) settings = data.settings;
     if (data.leds) leds = data.leds;
-    if (data.modes) modes = data.modes;
+    if (data.modes) {
+      if (src === 'sse') {
+        // E15 保守策略：后端 get_live_status 无 version 字段（version 留给后端添加），
+        // 无法跨流排序，故 SSE 帧仅按盘位合并，且跳过用户 1s 内手动操作过的盘位，
+        // 避免旧的 SSE 快照覆盖新 status / 本地操作导致 modes 闪跳；窗口外旧帧风险可容忍。
+        const now = Date.now();
+        for (const led in data.modes) {
+          if (now - (lastLocalTouch[led] || 0) < 1000) continue;
+          modes[led] = data.modes[led];
+        }
+      } else {
+        // /api/status 完整快照，整体替换
+        modes = data.modes;
+      }
+    }
 
     const netChip = document.getElementById('net-chip');
     if (netChip) {
@@ -114,7 +130,9 @@
     api('POST', '/api/control', { led, action: next }).then((r) => {
       if (r.success) {
         updateUI(led, next);
-        const name = led.match(/disk(\d+)/) ? '磁盘' + RegExp.$1 : led;
+        lastLocalTouch[led] = Date.now();
+        const m = led.match(/disk(\d+)/);
+        const name = m ? '磁盘' + m[1] : led;
         toast(name + ' → ' + LABELS[(i + 1) % 3]);
       } else toast(r.message, 'err');
     });
@@ -123,7 +141,10 @@
   function allMode(m) {
     api('POST', '/api/all/' + m, {}).then((r) => {
       if (r.success) {
-        leds.forEach((l) => updateUI(l, m));
+        leds.forEach((l) => {
+          updateUI(l, m);
+          lastLocalTouch[l] = Date.now();
+        });
         toast('已全部设为 ' + LABELS[['off', 'on', 'auto'].indexOf(m)]);
       } else toast(r.message, 'err');
     });
@@ -205,6 +226,7 @@
           if (r.success) {
             sel.dataset.prev = val;
             updateUI(sel.dataset.led, val);
+            lastLocalTouch[sel.dataset.led] = Date.now();
             toast(sel.dataset.led + ' → ' + (EFFECT_LABELS[val] || val));
           } else {
             sel.value = sel.dataset.prev;
@@ -338,7 +360,9 @@
     eventSource.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
-        applyStatus({ ...data, modes: data.modes || modes });
+        // E15: SSE payload 始终含 modes（get_live_status 快照），无需合并占位；
+        // 竞态由 applyStatus(src='sse') 内的本地操作保护窗处理
+        applyStatus(data, 'sse');
       } catch (_) { /* ignore */ }
     };
     eventSource.onerror = () => {
