@@ -204,11 +204,14 @@ class PilotHandler(BaseHTTPRequestHandler):
                 'success': False,
                 'message': f'登录尝试过多，请 {remaining // 60 + 1} 分钟后再试',
             })
+        username = data.get('username', '')
         if not self.app.auth.verify_credentials(
-                data.get('username', ''), data.get('password', '')):
+                username, data.get('password', '')):
             self.app.auth.record_failed_login(ip)
+            print(f'Login failed: user={username!r} ip={ip}')
             return self._json(401, {'success': False, 'message': '用户名或密码错误'})
         self.app.auth.record_successful_login(ip)
+        print(f'Login ok: {username} from {ip}')
         session, csrf = self.app.auth.create_session()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
