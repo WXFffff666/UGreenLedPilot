@@ -1,12 +1,13 @@
 """UGreenLedPilot — LED control core for UGREEN DXP4800 Plus on fnOS."""
 
 import glob
-import json
 import os
 import re
 import subprocess
 import threading
 import time
+
+from utils import load_json, save_json
 
 VALID_MODES = ['off', 'on', 'auto']
 MAX_DISK_LEDS = 4
@@ -16,7 +17,6 @@ LED_STATUS_RE = re.compile(
     r'brightness = (?P<brightness>\d+), color = RGB\((?P<r>\d+), (?P<g>\d+), (?P<b>\d+)\)'
 )
 
-# DXP4800 Plus: 4 bays, HCTL X:0:0:0 -> disk(X+1)
 DXP4800_PLUS_PROFILE = {
     'id': 'dxp4800plus',
     'name': 'DXP4800 Plus',
@@ -28,8 +28,11 @@ DXP4800_PLUS_PROFILE = {
 
 BLINK_ON_MS = 80
 BLINK_OFF_MS = 120
-MONITOR_INTERVAL = 0.5
+MONITOR_ACTIVE_INTERVAL = 0.4
+MONITOR_IDLE_INTERVAL = 2.0
+HOTPLUG_INTERVAL = 2.0
 ACTIVITY_IO_THRESHOLD = 1
+SETTINGS_SAVE_DELAY = 0.8
 
 WHITE = [255, 255, 255]
 NETDEV_ORANGE = [255, 165, 0]
@@ -71,25 +74,6 @@ def make_cli_runner(cli_path):
         except Exception as e:
             return False, '', str(e)
     return run
-
-
-def load_json(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception as e:
-            print(f'Load failed: {path} — {e}')
-    return default
-
-
-def save_json(path, data):
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f'Save FAILED: {path} — {e}')
 
 
 def led_status_to_mode(status):
@@ -143,7 +127,6 @@ def disk_count_from_leds(statuses):
 
 
 def detect_model():
-    """Private build: always target DXP4800 Plus profile."""
     product = ''
     ok, out, _ = run_cmd('dmidecode', '--string', 'system-product-name')
     if ok and out:
@@ -269,7 +252,6 @@ def detect_net_iface():
 
 
 def disk_signature():
-    """Disk topology fingerprint for hotplug — only used when disk LEDs are in auto mode."""
     keys = []
     for path in sorted(glob.glob('/sys/block/sd*')):
         info = block_device_info(path)
@@ -282,7 +264,6 @@ def disk_signature():
 
 
 def net_signature():
-    """Network carrier fingerprint — only used when netdev LED is in auto mode."""
     iface = detect_net_iface()
     carrier = ''
     if iface:
@@ -319,11 +300,51 @@ def disk_present(dev):
     return bool(dev) and os.path.isfile(f'/sys/block/{dev}/stat')
 
 
+def quick_hardware_signature():
+    return (disk_signature(), net_signature())
+
+
+class StatusBroadcaster:
+    """Thread-safe pub/sub for SSE clients."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._subscribers = []
+        self._version = 0
+
+    def subscribe(self):
+        q = []
+        with self._lock:
+            self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q):
+        with self._lock:
+            if q in self._subscribers:
+                self._subscribers.remove(q)
+
+    def publish(self, payload):
+        with self._lock:
+            self._version += 1
+            dead = []
+            for q in self._subscribers:
+                if len(q) > 20:
+                    dead.append(q)
+                else:
+                    q.append(payload)
+            for q in dead:
+                self._subscribers.remove(q)
+
+    @property
+    def version(self):
+        return self._version
+
+
 class PilotController:
-    """LED controller — mode-aware hotplug, activity blink."""
+    """LED controller with mode-aware hotplug, CLI dedup, adaptive monitoring."""
 
     def __init__(self, led_names, run, state_file, settings_file,
-                 ata_map=None, hctl_map=None, disk_count=4):
+                 ata_map=None, hctl_map=None, disk_count=4, broadcaster=None):
         self.leds = led_names
         self.run = run
         self.state_file = state_file
@@ -331,6 +352,7 @@ class PilotController:
         self.ata_map = ata_map or DXP4800_PLUS_PROFILE['ata_map']
         self.hctl_map = hctl_map or DXP4800_PLUS_PROFILE['hctl_map']
         self.disk_count = min(disk_count, MAX_DISK_LEDS)
+        self.broadcaster = broadcaster or StatusBroadcaster()
         self.modes = {}
         self.activity = {}
         self.presence = {}
@@ -342,10 +364,14 @@ class PilotController:
         self._prev_disk_io = {}
         self._disk_sig = None
         self._net_sig = None
-        self._lock = threading.Lock()
+        self._last_applied = {}
+        self._lock = threading.RLock()
         self._stop = threading.Event()
         self._thread = None
         self._rescan_count = 0
+        self._settings_dirty = False
+        self._settings_timer = None
+        self._last_hotplug_check = 0.0
 
     def _load_settings(self):
         saved = load_json(self.settings_file, {})
@@ -357,8 +383,19 @@ class PilotController:
             settings[led] = base
         return settings
 
-    def _save_settings(self):
-        save_json(self.settings_file, self.settings)
+    def _schedule_settings_save(self):
+        self._settings_dirty = True
+        if self._settings_timer:
+            self._settings_timer.cancel()
+        self._settings_timer = threading.Timer(SETTINGS_SAVE_DELAY, self._flush_settings)
+        self._settings_timer.daemon = True
+        self._settings_timer.start()
+
+    def _flush_settings(self):
+        with self._lock:
+            if self._settings_dirty:
+                save_json(self.settings_file, self.settings)
+                self._settings_dirty = False
 
     def get_settings(self, led):
         return dict(self.settings.get(led, DEFAULT_SETTINGS.get(led, {
@@ -373,42 +410,48 @@ class PilotController:
         return self.set_color(led, c[0], c[1], c[2])
 
     def set_color(self, led, r, g, b):
-        if led not in self.leds:
-            return False, f'Invalid LED: {led}'
-        r, g, b = max(0, min(255, int(r))), max(0, min(255, int(g))), max(0, min(255, int(b)))
-        self.settings.setdefault(led, {})['color'] = [r, g, b]
-        self._save_settings()
-        mode = self.modes.get(led, 'off')
-        if mode != 'off':
-            ok, err = self._apply(led, mode, self.activity.get(led, False))
-            return ok, err
+        with self._lock:
+            if led not in self.leds:
+                return False, f'Invalid LED: {led}'
+            r, g, b = max(0, min(255, int(r))), max(0, min(255, int(g))), max(0, min(255, int(b)))
+            self.settings.setdefault(led, {})['color'] = [r, g, b]
+            self._schedule_settings_save()
+            mode = self.modes.get(led, 'off')
+            if mode != 'off':
+                ok, err = self._apply(led, mode, self.activity.get(led, False))
+                self._notify()
+                return ok, err
         ok, _, err = self.run(led, '-on', '-color', str(r), str(g), str(b))
         return ok, err
 
     def set_brightness(self, led, brightness):
-        if led not in self.leds:
-            return False, f'Invalid LED: {led}'
-        brightness = max(0, min(255, int(brightness)))
-        self.settings.setdefault(led, {})['brightness'] = brightness
-        self._save_settings()
-        mode = self.modes.get(led, 'off')
-        if mode != 'off':
-            ok, err = self._apply(led, mode, self.activity.get(led, False))
-            return ok, err
-        return True, 'OK'
+        with self._lock:
+            if led not in self.leds:
+                return False, f'Invalid LED: {led}'
+            brightness = max(0, min(255, int(brightness)))
+            self.settings.setdefault(led, {})['brightness'] = brightness
+            self._schedule_settings_save()
+            mode = self.modes.get(led, 'off')
+            if mode != 'off':
+                ok, err = self._apply(led, mode, self.activity.get(led, False))
+                self._notify()
+                return ok, err
+            return True, 'OK'
 
     def set_global_brightness(self, brightness):
-        brightness = max(0, min(255, int(brightness)))
-        for led in self.leds:
-            self.settings.setdefault(led, {})['brightness'] = brightness
-        self._save_settings()
-        errors = []
-        for led in self.leds:
-            if self.modes.get(led) != 'off':
-                ok, err = self._apply(led, self.modes[led], self.activity.get(led, False))
-                if not ok:
-                    errors.append(f'{led}: {err}')
-        return not errors, '; '.join(errors) if errors else 'OK'
+        with self._lock:
+            brightness = max(0, min(255, int(brightness)))
+            for led in self.leds:
+                self.settings.setdefault(led, {})['brightness'] = brightness
+            self._schedule_settings_save()
+            errors = []
+            for led in self.leds:
+                if self.modes.get(led) != 'off':
+                    ok, err = self._apply(led, self.modes[led], self.activity.get(led, False))
+                    if not ok:
+                        errors.append(f'{led}: {err}')
+            self._notify()
+            return not errors, '; '.join(errors) if errors else 'OK'
 
     def _needs_disk_hotplug(self):
         for slot in range(1, self.disk_count + 1):
@@ -420,8 +463,15 @@ class PilotController:
         return self.modes.get('netdev') == 'auto'
 
     def needs_hotplug_monitor(self):
-        """Only auto-mode LEDs need hardware topology monitoring."""
         return self._needs_disk_hotplug() or self._needs_net_hotplug()
+
+    def _has_auto_activity_targets(self):
+        if self.modes.get('netdev') == 'auto':
+            return True
+        for slot in range(1, self.disk_count + 1):
+            if self.modes.get(f'disk{slot}') == 'auto':
+                return True
+        return False
 
     def _is_present(self, led):
         if led == 'power':
@@ -443,26 +493,31 @@ class PilotController:
         self._disk_sig = disk_signature()
         self._net_sig = net_signature()
 
+    def _apply_key(self, led, mode, activity):
+        cfg = self.get_settings(led)
+        return (mode, activity, tuple(cfg['color']), cfg['brightness'])
+
     def restore_state(self, hardware_modes=None, apply_hardware=True):
         hardware_modes = hardware_modes or {}
-        saved = load_json(self.state_file, {})
-        self._disk_map = detect_disks(self.ata_map, self.hctl_map, self.disk_count)
-        self._net_iface = detect_net_iface()
-        self._refresh_signatures()
-        self._update_presence()
-        for led in self.leds:
-            mode = saved.get(led, hardware_modes.get(led, 'auto'))
-            if mode not in VALID_MODES:
-                mode = 'auto'
-            # Only auto mode cares about presence at restore time
-            if mode == 'auto' and led.startswith('disk') and not self._is_present(led):
-                mode = 'off'
-            self.modes[led] = mode
-            self.activity[led] = False
-            if apply_hardware:
-                ok, msg = self._apply(led, mode, activity=False)
-                if not ok:
-                    print(f'Restore {led} failed: {msg}')
+        with self._lock:
+            saved = load_json(self.state_file, {})
+            self._disk_map = detect_disks(self.ata_map, self.hctl_map, self.disk_count)
+            self._net_iface = detect_net_iface()
+            self._refresh_signatures()
+            self._update_presence()
+            for led in self.leds:
+                mode = saved.get(led, hardware_modes.get(led, 'auto'))
+                if mode not in VALID_MODES:
+                    mode = 'auto'
+                if mode == 'auto' and led.startswith('disk') and not self._is_present(led):
+                    mode = 'off'
+                self.modes[led] = mode
+                self.activity[led] = False
+                if apply_hardware:
+                    ok, msg = self._apply(led, mode, activity=False)
+                    if not ok:
+                        print(f'Restore {led} failed: {msg}')
+            self._notify()
 
     def set_mode(self, led, mode):
         with self._lock:
@@ -476,52 +531,53 @@ class PilotController:
             self.modes[led] = mode
             self.activity[led] = False
             self._persist()
+            self._notify()
             return True, 'OK'
 
     def _apply(self, led, mode, activity=False):
+        key = self._apply_key(led, mode, activity)
+        if self._last_applied.get(led) == key:
+            return True, 'OK'
+
         cfg = self.get_settings(led)
         cr, cg, cb = map(str, cfg['color'])
         brightness = str(cfg['brightness'])
 
         if mode == 'off':
             ok, _, err = self.run(led, '-off')
-            return ok, err or 'OK'
-
-        # on mode: always light up regardless of disk/net presence
-        if mode == 'on':
+        elif mode == 'on':
             ok, _, err = self.run(led, '-on', '-color', cr, cg, cb, '-brightness', brightness)
-            return ok, err or 'OK'
-
-        # auto mode: respect presence
-        if not self._is_present(led):
+        elif not self._is_present(led):
             ok, _, err = self.run(led, '-off')
-            return ok, err or 'OK'
-
-        if activity:
+        elif activity:
             ok, _, err = self.run(
                 led, '-on', '-blink', str(BLINK_ON_MS), str(BLINK_OFF_MS),
                 '-color', cr, cg, cb, '-brightness', brightness,
             )
         else:
             ok, _, err = self.run(led, '-on', '-color', cr, cg, cb, '-brightness', brightness)
+
+        if ok:
+            self._last_applied[led] = key
         return ok, err or 'OK'
 
     def _persist(self):
         save_json(self.state_file, dict(self.modes))
 
     def force_remap(self):
-        """Manual disk remap — only useful when auto-mode disks are configured."""
         with self._lock:
-            self._on_hardware_changed(force=True)
+            self._on_hardware_changed()
+            self._notify()
             return True, 'OK'
 
     def start_monitor(self):
-        self._disk_map = detect_disks(self.ata_map, self.hctl_map, self.disk_count)
-        self._net_iface = detect_net_iface()
-        self._refresh_signatures()
-        self._update_presence()
+        with self._lock:
+            self._disk_map = detect_disks(self.ata_map, self.hctl_map, self.disk_count)
+            self._net_iface = detect_net_iface()
+            self._refresh_signatures()
+            self._update_presence()
         print(f'DXP4800 Plus — Disks: {self._disk_map}, Network: {self._net_iface or "none"}')
-        print(f'Hotplug monitor: {"enabled" if self.needs_hotplug_monitor() else "disabled (no auto-mode LEDs)"}')
+        print(f'Hotplug monitor: {"enabled" if self.needs_hotplug_monitor() else "disabled"}')
 
         if self._net_iface:
             base = f'/sys/class/net/{self._net_iface}/statistics'
@@ -531,14 +587,16 @@ class PilotController:
             if disk_present(dev):
                 self._prev_disk_io[slot] = read_disk_io(f'/sys/block/{dev}/stat')
 
-        self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True, name='pilot-monitor')
         self._thread.start()
 
     def stop_monitor(self):
         self._stop.set()
+        if self._settings_timer:
+            self._settings_timer.cancel()
+        self._flush_settings()
 
-    def _on_hardware_changed(self, force=False):
-        """Full remap — only when auto-mode hardware topology changes."""
+    def _on_hardware_changed(self):
         old_map = dict(self._disk_map)
         self._disk_map = detect_disks(self.ata_map, self.hctl_map, self.disk_count)
         self._net_iface = detect_net_iface()
@@ -548,7 +606,7 @@ class PilotController:
 
         for led in self.leds:
             mode = self.modes.get(led, 'auto')
-            if mode == 'off' or mode == 'on':
+            if mode in ('off', 'on'):
                 continue
             if led.startswith('disk') and not self._is_present(led):
                 self._apply(led, 'auto', activity=False)
@@ -566,9 +624,8 @@ class PilotController:
             self._prev_net_tx = read_stats(f'{base}/tx_bytes')
 
     def _maybe_rescan(self):
-        """Skip entirely when no LED is in auto mode — on/off don't need hotplug scans."""
         if not self.needs_hotplug_monitor():
-            return
+            return False
 
         changed = False
         if self._needs_disk_hotplug():
@@ -583,27 +640,48 @@ class PilotController:
                 changed = True
         if changed:
             self._on_hardware_changed()
+            return True
+        return False
+
+    def _monitor_interval(self):
+        return MONITOR_ACTIVE_INTERVAL if self._has_auto_activity_targets() else MONITOR_IDLE_INTERVAL
 
     def _monitor_loop(self):
-        while not self._stop.wait(MONITOR_INTERVAL):
+        while not self._stop.is_set():
+            interval = self._monitor_interval()
+            notified = False
             try:
+                now = time.monotonic()
+                do_hotplug = (
+                    self.needs_hotplug_monitor()
+                    and (now - self._last_hotplug_check) >= HOTPLUG_INTERVAL
+                )
+                if do_hotplug:
+                    self._last_hotplug_check = now
+
                 with self._lock:
-                    if self.needs_hotplug_monitor():
-                        self._maybe_rescan()
-                    self._check_network()
-                    self._check_disks()
+                    if do_hotplug and self._maybe_rescan():
+                        notified = True
+                    if self._check_network():
+                        notified = True
+                    if self._check_disks():
+                        notified = True
+                if notified:
+                    self._notify()
             except Exception as e:
                 print(f'Monitor error: {e}')
+            self._stop.wait(interval)
 
     def _check_network(self):
         led = 'netdev'
         if self.modes.get(led) != 'auto':
-            return
+            return False
         if not self._net_iface:
             if self.activity.get(led):
                 self.activity[led] = False
                 self._apply(led, 'auto', activity=False)
-            return
+                return True
+            return False
         base = f'/sys/class/net/{self._net_iface}/statistics'
         rx = read_stats(f'{base}/rx_bytes')
         tx = read_stats(f'{base}/tx_bytes')
@@ -613,8 +691,11 @@ class PilotController:
         if active != self.activity.get(led):
             self.activity[led] = active
             self._apply(led, 'auto', activity=active)
+            return True
+        return False
 
     def _check_disks(self):
+        changed = False
         for slot in range(1, self.disk_count + 1):
             led = f'disk{slot}'
             if self.modes.get(led) != 'auto' or led not in self.leds:
@@ -625,6 +706,7 @@ class PilotController:
                     self.activity[led] = False
                     self.presence[led] = False
                     self._apply(led, 'auto', activity=False)
+                    changed = True
                 continue
             self.presence[led] = True
             io = read_disk_io(f'/sys/block/{dev}/stat')
@@ -635,18 +717,36 @@ class PilotController:
             if active != self.activity.get(led):
                 self.activity[led] = active
                 self._apply(led, 'auto', activity=active)
+                changed = True
+        return changed
+
+    def get_live_status(self):
+        """Lightweight snapshot for SSE / API."""
+        with self._lock:
+            return {
+                'modes': dict(self.modes),
+                'activity': dict(self.activity),
+                'presence': dict(self.presence),
+                'net_iface': self._net_iface,
+                'hotplug_monitor': self.needs_hotplug_monitor(),
+                'rescan_count': self._rescan_count,
+            }
 
     def get_status(self):
-        return {
-            'modes': dict(self.modes),
-            'activity': dict(self.activity),
-            'presence': dict(self.presence),
-            'settings': {k: dict(v) for k, v in self.settings.items() if k in self.leds},
-            'disk_map': {str(k): v for k, v in self._disk_map.items()},
-            'net_iface': self._net_iface,
-            'leds': self.leds,
-            'presets': COLOR_PRESETS,
-            'hotplug_monitor': self.needs_hotplug_monitor(),
-            'rescan_count': self._rescan_count,
-            'model': DXP4800_PLUS_PROFILE,
-        }
+        with self._lock:
+            return {
+                'modes': dict(self.modes),
+                'activity': dict(self.activity),
+                'presence': dict(self.presence),
+                'settings': {k: dict(v) for k, v in self.settings.items() if k in self.leds},
+                'disk_map': {str(k): v for k, v in self._disk_map.items()},
+                'net_iface': self._net_iface,
+                'leds': self.leds,
+                'presets': COLOR_PRESETS,
+                'hotplug_monitor': self.needs_hotplug_monitor(),
+                'rescan_count': self._rescan_count,
+                'model': DXP4800_PLUS_PROFILE,
+            }
+
+    def _notify(self):
+        self.broadcaster.publish(self.get_live_status())

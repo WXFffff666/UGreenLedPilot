@@ -1,7 +1,7 @@
 appname               = UGreenLedPilot
-version               = 1.1.0
+version               = 2.0.0
 display_name          = UGreen LED Pilot
-desc                  = 绿联 DXP4800 Plus 专用 LED 控制。三档模式（关闭/常亮/自动），模式感知热插拔（仅自动模式检测硬件变化），插盘亮/拔盘灭/活动闪烁，管理员鉴权+CSRF+登录限流。
+desc                  = 绿联 DXP4800 Plus 专用 LED 控制 v2。模块化架构、SSE 实时推送、CLI 去重、自适应监控、独立前端 UI。
 arch                  = x86_64
 source                = thirdparty
 maintainer            = WXFffff666
@@ -9,4 +9,4 @@ distributor           = WXFffff666
 desktop_uidir         = ui
 desktop_applaunchname = UGreenLedPilot.Application
 service_port          = 19580
-changelog             = v1.1.0: DXP4800 Plus 专用。模式感知热插拔（常亮/关闭不扫描）、安全加固（CSRF/限流/安全头）、手动重映射盘位。
+changelog             = v2.0.0: 大重构。ThreadingHTTPServer+SSE 替代轮询；CLI 状态去重；自适应监控间隔；独立 www 前端。

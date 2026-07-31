@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UGreenLedPilot</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="logo" aria-hidden="true">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="#041018"><circle cx="12" cy="12" r="8"/></svg>
+      </div>
+      <div class="title">
+        <h1>UGreenLedPilot</h1>
+        <p id="subtitle">DXP4800 Plus · 4 盘位</p>
+      </div>
+      <div class="chips">
+        <span class="chip" id="net-chip">网络: —</span>
+        <span class="chip muted" id="monitor-chip">监控: —</span>
+      </div>
+    </header>
+
+    <main class="panel">
+      <div class="panel-hd">
+        <h2>指示灯控制</h2>
+        <label class="global-bright">
+          <span>全局亮度</span>
+          <input type="range" id="global-brightness" min="0" max="255" value="255">
+        </label>
+      </div>
+
+      <div class="legend">
+        <span class="leg"><i class="dot off"></i>关闭</span>
+        <span class="leg"><i class="dot on"></i>常亮</span>
+        <span class="leg"><i class="dot auto"></i>自动</span>
+      </div>
+      <p class="hint">常亮/关闭不扫描热插拔；仅自动模式在硬件变化时重映射。</p>
+
+      <section class="sys-grid" id="sys-grid">
+        <article class="sys-card sitem" data-led="power">
+          <div class="sys-top">
+            <span class="sys-name">电源</span>
+            <div class="led" id="power-led"></div>
+          </div>
+          <div class="presence on" id="power-presence">系统运行</div>
+          <div class="ctrl-row">
+            <input type="color" class="cpick" data-led="power" value="#ffffff">
+            <input type="range" class="brit" data-led="power" min="0" max="255" value="255">
+          </div>
+          <div class="presets" data-led="power"></div>
+          <div class="tgl3" data-led="power"><div class="trk3"><div class="thm3"></div></div><span class="tlbl3"></span></div>
+        </article>
+        <article class="sys-card sitem" data-led="netdev">
+          <div class="sys-top">
+            <span class="sys-name">网络</span>
+            <div class="led" id="netdev-led"></div>
+          </div>
+          <div class="presence" id="netdev-presence">检测中</div>
+          <div class="ctrl-row">
+            <input type="color" class="cpick" data-led="netdev" value="#ffa500">
+            <input type="range" class="brit" data-led="netdev" min="0" max="255" value="255">
+          </div>
+          <div class="presets" data-led="netdev"></div>
+          <div class="tgl3" data-led="netdev"><div class="trk3"><div class="thm3"></div></div><span class="tlbl3"></span></div>
+        </article>
+      </section>
+
+      <section class="dsection">
+        <h3 class="dtitle">磁盘 · 自动：插盘亮 / 拔盘灭 / 活动闪</h3>
+        <div class="dgrid" id="disk-grid"></div>
+      </section>
+
+      <div class="fbar">
+        <button class="abtn p" id="btn-all-on">全部常亮</button>
+        <button class="abtn a" id="btn-all-auto">全部自动</button>
+        <button class="abtn s" id="btn-all-off">全部关闭</button>
+      </div>
+      <div class="fbar">
+        <button class="abtn s" id="btn-cpw">改密</button>
+        <button class="abtn a" id="btn-remap">重映射盘位</button>
+        <button class="abtn a" id="btn-save">保存</button>
+        <button class="abtn s" id="btn-logout">退出</button>
+        <button class="abtn d" id="btn-reset">重置</button>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="pw-dialog">
+    <form method="dialog" id="pw-form">
+      <h3>修改密码</h3>
+      <input id="pw-old" type="password" placeholder="旧密码" required>
+      <input id="pw-new" type="password" placeholder="新密码 (至少8位)" required minlength="8">
+      <div class="dialog-actions">
+        <button type="button" class="abtn s" id="pw-cancel">取消</button>
+        <button type="submit" class="abtn p">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
