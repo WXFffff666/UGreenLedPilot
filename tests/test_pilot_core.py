@@ -6,8 +6,11 @@ import json
 import os
 import secrets
 import shutil
+import socket
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -21,6 +24,7 @@ from pilot_core import (
 )
 from auth_manager import AuthManager, PBKDF2_ITERATIONS
 from http_handler import PilotHandler
+from uevent_watcher import UeventWatcher
 
 
 class TestDXP4800PlusMapping(unittest.TestCase):
@@ -302,6 +306,111 @@ class TestAuthUsername(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body['success'])
         self.assertTrue(body['csrf_token'])
+
+
+@unittest.skipIf(os.name == 'nt', 'POSIX file permission semantics')
+class TestAuthFilePerms(unittest.TestCase):
+    """auth.json must be chmod 0600 after every write (E-ADD-2)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.auth_file = os.path.join(self.dir, 'auth.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_chmod_0600_called_on_init(self):
+        with patch('auth_manager.os.chmod') as mock_chmod:
+            AuthManager(self.auth_file)
+        self.assertTrue(mock_chmod.called)
+        mock_chmod.assert_any_call(self.auth_file, 0o600)
+
+    def test_chmod_0600_called_after_password_change(self):
+        with patch('auth_manager.os.chmod') as mock_chmod:
+            auth = AuthManager(self.auth_file)
+            before = mock_chmod.call_count
+            ok, _ = auth.change_password('admin123', 'newpass123456')
+            self.assertTrue(ok)
+            self.assertGreater(mock_chmod.call_count, before)
+            mock_chmod.assert_any_call(self.auth_file, 0o600)
+
+    def test_posix_mode_600(self):
+        AuthManager(self.auth_file)
+        mode = os.stat(self.auth_file).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+
+class _FakeNetlinkSocket:
+    """Mimics a netlink socket with 3s timeout: recv blocks briefly, then raises socket.timeout."""
+
+    def __init__(self):
+        self.closed = False
+
+    def setsockopt(self, *args):
+        pass
+
+    def bind(self, *args):
+        pass
+
+    def settimeout(self, *args):
+        pass
+
+    def recv(self, *args):
+        time.sleep(0.2)
+        raise socket.timeout('timeout')
+
+    def close(self):
+        self.closed = True
+
+
+class TestUeventWatcher(unittest.TestCase):
+    """UeventWatcher start/stop thread lifecycle (E9: stop->start must not double-thread)."""
+
+    def _wait_running(self, watcher, wait=2.0):
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            if watcher.is_running():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _watcher_thread_count(self):
+        return len([t for t in threading.enumerate() if t.name == 'uevent-watcher'])
+
+    def test_stop_then_start_no_duplicate_thread(self):
+        with patch('uevent_watcher.socket') as mock_sock:
+            mock_sock.timeout = socket.timeout  # except-clause must see the real class
+            fake = _FakeNetlinkSocket()
+            mock_sock.socket.return_value = fake
+            watcher = UeventWatcher(callback=MagicMock())
+            watcher.start()
+            self.assertTrue(self._wait_running(watcher))
+            old_thread = watcher._thread
+            watcher.stop()
+            # stop() must join the old thread and drop its reference (bug: returns early)
+            self.assertIsNone(watcher._thread)
+            self.assertFalse(old_thread.is_alive())
+            self.assertFalse(watcher.is_running())
+            # immediate restart: old thread already joined -> no double netlink socket
+            watcher.start()
+            self.assertTrue(self._wait_running(watcher))
+            self.assertIsNot(watcher._thread, old_thread)
+            self.assertEqual(self._watcher_thread_count(), 1)
+            self.assertEqual(mock_sock.socket.call_count, 2)  # one socket per start
+            watcher.stop()
+            self.assertIsNone(watcher._thread)
+            self.assertTrue(fake.closed)
+
+    def test_netlink_unavailable_falls_back(self):
+        with patch('uevent_watcher.socket') as mock_sock:
+            mock_sock.socket.side_effect = OSError('netlink unavailable')
+            watcher = UeventWatcher(callback=MagicMock())
+            watcher.start()  # must not raise
+            self.assertFalse(self._wait_running(watcher))
+            self.assertFalse(watcher.available)
+            watcher.stop()  # safe even though the thread already exited
+            self.assertIsNone(watcher._thread)
+            self.assertFalse(watcher.is_running())
 
 
 if __name__ == '__main__':

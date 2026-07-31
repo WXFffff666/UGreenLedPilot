@@ -23,12 +23,21 @@ class UeventWatcher:
     def start(self):
         if self.is_running():
             return
+        if self._thread and self._thread.is_alive():
+            # A previous thread may still be winding down (blocked in recv up to 3s).
+            # Join it first so a second netlink socket is never bound concurrently.
+            self._stop.set()
+            self._thread.join(timeout=4.0)
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True, name='uevent-watcher')
         self._thread.start()
 
     def stop(self):
         self._stop.set()
+        if self._thread:
+            # 4s > recv timeout 3s: the loop observes _stop before the join times out.
+            self._thread.join(timeout=4.0)
+            self._thread = None
         self._running = False
 
     def _loop(self):
