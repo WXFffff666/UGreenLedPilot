@@ -41,6 +41,7 @@ SPEED_BLINK_MID_OFF_MS = 400
 SPEED_BLINK_FAST_ON_MS = 100
 SPEED_BLINK_FAST_OFF_MS = 100
 ACTIVITY_IO_THRESHOLD = 1
+CHASE_STEP_INTERVAL = 0.2  # seconds — minimum gap between chase steps (>= 200ms)
 SETTINGS_SAVE_DELAY = 0.8
 ACTIVITY_FAST_INTERVAL = 0.5
 ACTIVITY_SLOW_INTERVAL = 3.0
@@ -398,6 +399,12 @@ class PilotController:
         self._settings_timer = None
         self._last_hotplug_check = 0.0
         self._activity_idle_rounds = 0
+        self.chase_enabled = False
+        self._chase_leds = []
+        self._chase_index = 0
+        self._chase_current = None
+        self._chase_clock = time.monotonic  # injectable for tests
+        self._chase_next_at = 0.0
         self._uevent = UeventWatcher(self._on_uevent_hotplug)
 
     def _load_settings(self):
@@ -513,7 +520,7 @@ class PilotController:
         return self.modes.get('netdev') == 'auto'
 
     def needs_hotplug_monitor(self):
-        return self._needs_disk_hotplug() or self._needs_net_hotplug()
+        return self.chase_enabled or self._needs_disk_hotplug() or self._needs_net_hotplug()
 
     def _has_auto_activity_targets(self):
         if not self.activity_blink_enabled:
@@ -526,6 +533,10 @@ class PilotController:
         return False
 
     def _monitor_tier(self):
+        if self.chase_enabled:
+            # chase is a live demo: it must run on the fast activity cadence,
+            # never stall in the sleep/hotplug branches
+            return 'activity'
         if not self.needs_hotplug_monitor():
             return 'sleep'
         if not self.activity_blink_enabled:
@@ -573,6 +584,39 @@ class PilotController:
                         self._apply(led, 'auto', activity=True)
             self._notify()
             return True, 'OK'
+
+    def set_chase(self, enabled):
+        """Demo chase (running light) over the disk LEDs.
+
+        chase is an independent demo effect: it forces the monitor into the
+        'activity' tier, keeps the fast interval (idle backoff skipped) and
+        yields to live activity (activity-blink outranks the demo). Any
+        set_mode() call stops the chase and restores the per-LED modes.
+        """
+        with self._lock:
+            if not enabled:
+                self._disable_chase()
+            else:
+                self.chase_enabled = True
+                self._chase_leds = [f'disk{i}' for i in range(1, self.disk_count + 1)
+                                    if f'disk{i}' in self.leds]
+                self._chase_index = 0
+                self._chase_current = None
+                self._chase_next_at = 0.0
+            self._activity_idle_rounds = 0
+            self._sync_watchers()
+            self._wake_monitor()
+            self._notify()
+            return True, 'OK'
+
+    def _disable_chase(self):
+        """Stop the chase demo and restore hardware to the per-LED modes."""
+        self.chase_enabled = False
+        chase_leds, self._chase_leds = self._chase_leds, []
+        self._chase_current = None
+        for led in chase_leds:
+            if led in self.leds:
+                self._apply(led, self.modes.get(led, 'off'))
 
     def _is_present(self, led):
         if led == 'power':
@@ -632,6 +676,9 @@ class PilotController:
                 return False, f'Invalid LED: {led}'
             if mode not in VALID_MODES:
                 return False, f'Invalid mode: {mode}'
+            if self.chase_enabled:
+                # any user mode change exits the demo and restores real modes
+                self._disable_chase()
             ok, msg = self._apply(led, mode, activity=False)
             if not ok:
                 return False, msg
@@ -802,6 +849,28 @@ class PilotController:
             return True
         return False
 
+    def _any_led_active(self):
+        return any(self.activity.get(led) for led in self.leds)
+
+    def _step_chase(self):
+        """Advance the chase demo one LED (running light). No-op until the
+        CHASE_STEP_INTERVAL has elapsed on the injectable _chase_clock.
+        Must be called with self._lock held. Returns True when a CLI apply
+        was issued."""
+        if not self._chase_leds:
+            return False
+        now = self._chase_clock()
+        if now < self._chase_next_at:
+            return False
+        self._chase_next_at = now + CHASE_STEP_INTERVAL
+        led = self._chase_leds[self._chase_index % len(self._chase_leds)]
+        self._chase_index = (self._chase_index + 1) % len(self._chase_leds)
+        if self._chase_current is not None and self._chase_current != led:
+            self._apply(self._chase_current, 'off')
+        self._chase_current = led
+        self._apply(led, 'on')
+        return True
+
     def _monitor_loop(self):
         while not self._stop.is_set():
             tier = self._monitor_tier()
@@ -833,6 +902,14 @@ class PilotController:
                             notified = True
                             self._activity_idle_rounds = 0
                             interval = ACTIVITY_FAST_INTERVAL
+                        elif self.chase_enabled:
+                            # chase demo: keep the fast cadence (no idle backoff)
+                            # and step the lights unless live activity is showing
+                            # (activity-blink outranks the demo, Todo 19 matrix)
+                            self._activity_idle_rounds = 0
+                            if not self._any_led_active():
+                                if self._step_chase():
+                                    notified = True
                         else:
                             self._activity_idle_rounds += 1
                             if self._activity_idle_rounds > 20:

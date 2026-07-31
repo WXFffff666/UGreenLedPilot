@@ -478,6 +478,208 @@ class TestSpeedAwareBlink(unittest.TestCase):
             '-color', '255', '165', '0', '-brightness', '255')
 
 
+class _FakeChaseClock:
+    """Injectable monotonic clock: tests control time for chase stepping."""
+
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, dt):
+        self.now += dt
+
+
+class _FakeLoopEvents:
+    """Drives N iterations of _monitor_loop synchronously: stop fires after
+    the Nth is_set() call and wake never blocks (no real sleeps/threads)."""
+
+    def __init__(self, iterations):
+        self._left = iterations
+
+    def is_set(self):
+        self._left -= 1
+        return self._left < 0
+
+    def wait(self, timeout=None):
+        return False
+
+    def clear(self):
+        pass
+
+    def set(self):
+        pass
+
+
+class TestChaseEffect(unittest.TestCase):
+    """F7c (Todo 18): demo chase (running light) over the disk LEDs.
+
+    chase is an independent demo effect: forces the monitor into the
+    'activity' tier (no sleep/hotplug stall), keeps the fast interval by
+    skipping the idle backoff, and yields to live activity (activity-blink
+    outranks the demo, Todo 19 matrix).
+    """
+
+    def _make_ctrl(self):
+        run = MagicMock(return_value=(True, '', ''))
+        ctrl = PilotController(
+            ['power', 'netdev', 'disk1', 'disk2'],
+            run, '/tmp/test_state.json', '/tmp/test_settings.json',
+            disk_count=2,
+        )
+        ctrl._uevent = MagicMock()
+        ctrl._uevent.is_running.return_value = False
+        return ctrl
+
+    def _all_off(self, ctrl):
+        for led in ctrl.leds:
+            ctrl.modes[led] = 'off'
+
+    def test_chase_forces_activity_tier_even_when_all_off(self):
+        ctrl = self._make_ctrl()
+        self._all_off(ctrl)
+        self.assertEqual(ctrl._monitor_tier(), 'sleep')  # baseline: nothing to monitor
+        ok, msg = ctrl.set_chase(True)
+        self.assertTrue(ok)
+        self.assertEqual(msg, 'OK')
+        self.assertTrue(ctrl.chase_enabled)
+        self.assertEqual(ctrl._chase_leds, ['disk1', 'disk2'])
+        self.assertTrue(ctrl.needs_hotplug_monitor())
+        self.assertEqual(ctrl._monitor_tier(), 'activity')
+        # activity-blink off must not demote the chase tier (hotplug branch would stall it)
+        ctrl.activity_blink_enabled = False
+        self.assertEqual(ctrl._monitor_tier(), 'activity')
+
+    def test_chase_off_restores_normal_tier(self):
+        ctrl = self._make_ctrl()
+        self._all_off(ctrl)
+        ctrl.set_chase(True)
+        self.assertEqual(ctrl._monitor_tier(), 'activity')
+        ok, msg = ctrl.set_chase(False)
+        self.assertTrue(ok)
+        self.assertFalse(ctrl.chase_enabled)
+        self.assertEqual(ctrl._chase_leds, [])
+        self.assertFalse(ctrl.needs_hotplug_monitor())
+        self.assertEqual(ctrl._monitor_tier(), 'sleep')
+
+    def test_chase_steps_disk_leds_in_order_with_min_interval(self):
+        ctrl = self._make_ctrl()
+        self._all_off(ctrl)
+        clock = _FakeChaseClock()
+        ctrl._chase_clock = clock
+        ctrl.set_chase(True)
+        ctrl.run.reset_mock()
+
+        # t=0: first tick lights disk1 (order starts at the first disk LED)
+        ctrl._stop = _FakeLoopEvents(2)
+        ctrl._wake_event = _FakeLoopEvents(2)
+        ctrl._monitor_loop()
+        self.assertEqual([c.args[0] for c in ctrl.run.call_args_list], ['disk1'])
+        ctrl.run.reset_mock()
+
+        # +0.3s (> 200ms step interval): light moves to disk2, disk1 goes off
+        clock.advance(0.3)
+        ctrl._stop = _FakeLoopEvents(2)
+        ctrl._wake_event = _FakeLoopEvents(2)
+        ctrl._monitor_loop()
+        on = [c for c in ctrl.run.call_args_list if '-off' not in c.args]
+        self.assertEqual([c.args[0] for c in on], ['disk2'])
+        self.assertTrue(any(c.args[0] == 'disk1' and '-off' in c.args
+                            for c in ctrl.run.call_args_list))
+        ctrl.run.reset_mock()
+
+        # +0.1s (below 200ms): step is throttled — no CLI calls
+        clock.advance(0.1)
+        ctrl._stop = _FakeLoopEvents(2)
+        ctrl._wake_event = _FakeLoopEvents(2)
+        ctrl._monitor_loop()
+        self.assertEqual(ctrl.run.call_count, 0)
+
+        # +0.2s: interval elapsed -> chase wraps back to disk1
+        clock.advance(0.2)
+        ctrl._stop = _FakeLoopEvents(2)
+        ctrl._wake_event = _FakeLoopEvents(2)
+        ctrl._monitor_loop()
+        self.assertTrue(any(c.args[0] == 'disk1' and '-off' not in c.args
+                            for c in ctrl.run.call_args_list))
+        self.assertTrue(any(c.args[0] == 'disk2' and '-off' in c.args
+                            for c in ctrl.run.call_args_list))
+
+    def test_set_mode_stops_chase_and_restores_original_modes(self):
+        ctrl = self._make_ctrl()
+        self._all_off(ctrl)
+        clock = _FakeChaseClock()
+        ctrl._chase_clock = clock
+        ctrl.set_chase(True)
+        ctrl.run.reset_mock()
+        # let the chase light disk1 first
+        ctrl._stop = _FakeLoopEvents(2)
+        ctrl._wake_event = _FakeLoopEvents(2)
+        ctrl._monitor_loop()
+        ctrl.run.reset_mock()
+
+        ok, msg = ctrl.set_mode('power', 'on')
+        self.assertTrue(ok)
+        self.assertFalse(ctrl.chase_enabled)
+        self.assertEqual(ctrl._chase_leds, [])
+        # the chase-lit disk1 is restored to its mode (off) — no stray LED stays on
+        self.assertTrue(any(c.args[0] == 'disk1' and '-off' in c.args
+                            for c in ctrl.run.call_args_list))
+        # power follows the user's new mode
+        self.assertTrue(any(c.args[0] == 'power' and '-on' in c.args
+                            for c in ctrl.run.call_args_list))
+        # tier back to normal (all off -> sleep)
+        self.assertEqual(ctrl._monitor_tier(), 'sleep')
+
+    def test_chase_skips_idle_backoff(self):
+        ctrl = self._make_ctrl()
+        self._all_off(ctrl)
+        clock = _FakeChaseClock()
+        ctrl._chase_clock = clock
+        ctrl.set_chase(True)
+        ctrl.run.reset_mock()
+        ctrl._activity_idle_rounds = 30  # would otherwise trigger the 3s backoff
+        ctrl._stop = _FakeLoopEvents(3)
+        ctrl._wake_event = _FakeLoopEvents(3)
+        ctrl._monitor_loop()
+        # chase keeps the fast interval: idle rounds stay pinned at 0
+        self.assertEqual(ctrl._activity_idle_rounds, 0)
+
+    def test_activity_pauses_chase_and_activity_blink_takes_over(self):
+        ctrl = self._make_ctrl()
+        self._all_off(ctrl)
+        ctrl.modes['netdev'] = 'auto'
+        ctrl._net_iface = 'eth0'
+        ctrl._net_ifaces = ['eth0']
+        ctrl._prev_net_rx = {'eth0': 1000}
+        ctrl._prev_net_tx = {'eth0': 2000}
+        ctrl.activity['netdev'] = False
+        clock = _FakeChaseClock()
+        ctrl._chase_clock = clock
+        ctrl.set_chase(True)
+        ctrl.run.reset_mock()
+
+        # sustained traffic -> netdev activity-blink; chase must not advance
+        with patch('pilot_core.read_stats', side_effect=[1100, 2000, 1300, 2000, 1500, 2000]):
+            ctrl._stop = _FakeLoopEvents(3)
+            ctrl._wake_event = _FakeLoopEvents(3)
+            ctrl._monitor_loop()
+        self.assertTrue(any(c.args[0] == 'netdev' and '-blink' in c.args
+                            for c in ctrl.run.call_args_list))
+        self.assertEqual(ctrl._chase_index, 0)
+        self.assertFalse(any(c.args[0] == 'disk1' for c in ctrl.run.call_args_list))
+        self.assertEqual(ctrl._activity_idle_rounds, 0)
+
+        # traffic stops -> chase resumes stepping
+        with patch('pilot_core.read_stats', side_effect=[1500, 2000, 1500, 2000]):
+            ctrl._stop = _FakeLoopEvents(2)
+            ctrl._wake_event = _FakeLoopEvents(2)
+            ctrl._monitor_loop()
+        self.assertTrue(any(c.args[0] == 'disk1' and '-off' not in c.args
+                            for c in ctrl.run.call_args_list))
+
+
 class TestMultiNicMonitoring(unittest.TestCase):
     """E13/F2: aggregate rx/tx across all NICs (DXP4800 Plus dual 2.5G)."""
 
