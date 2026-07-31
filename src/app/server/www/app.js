@@ -2,6 +2,8 @@
   'use strict';
 
   const LABELS = ['关闭', '常亮', '自动'];
+  // 效果选项：breath/blink/chase 为扩展效果，后端 Wave 5 对接 /api/control 的 action 校验后生效
+  const EFFECT_LABELS = { off: '关闭', on: '常亮', breath: '呼吸', blink: '闪烁', chase: '跑马灯', auto: '自动' };
   let csrf = '';
   let modes = {};
   let settings = {};
@@ -46,15 +48,22 @@
     const el = document.getElementById(led + '-led');
     if (el) {
       el.className = 'led';
-      if (mode === 'on') el.classList.add('on');
+      if (mode === 'on' || mode === 'breath' || mode === 'chase') el.classList.add(mode);
       else if (mode === 'auto') el.classList.add(activity ? 'blink' : 'auto');
+      else if (mode === 'blink') el.classList.add('blink');
     }
     const tgl = document.querySelector('.tgl3[data-led="' + led + '"]');
     if (tgl) {
-      const idx = ['off', 'on', 'auto'].indexOf(mode || 'off');
-      tgl.className = 'tgl3 st' + Math.max(idx, 0);
+      // 三档开关仅映射 off/on/auto；呼吸/闪烁/跑马灯归入「常亮」档位
+      const idx = mode === 'auto' ? 2 : (mode === 'off' ? 0 : 1);
+      tgl.className = 'tgl3 st' + idx;
       const lbl = tgl.querySelector('.tlbl3');
-      if (lbl) lbl.textContent = LABELS[idx] || '';
+      if (lbl) lbl.textContent = (mode && EFFECT_LABELS[mode]) || LABELS[idx] || '';
+    }
+    const sel = document.getElementById('effect-' + led);
+    if (sel && mode !== undefined && EFFECT_LABELS[mode]) {
+      sel.value = mode;
+      sel.dataset.prev = mode;
     }
     const pres = document.getElementById(led + '-presence');
     if (pres && present !== undefined) {
@@ -88,6 +97,8 @@
 
     const ab = document.getElementById('activity-blink');
     if (ab && data.activity_blink !== undefined) ab.checked = !!data.activity_blink;
+    const sb = document.getElementById('speed-blink');
+    if (sb && data.activity_blink !== undefined) sb.checked = !!data.activity_blink;
 
     if (data.presence) {
       for (const led in data.presence) {
@@ -160,6 +171,10 @@
         '<input type="color" class="cpick" data-led="' + led + '" value="#ffffff">' +
         '<input type="range" class="brit" data-led="' + led + '" min="0" max="255" value="255">' +
         '</div><div class="presets" data-led="' + led + '"></div>' +
+        '<select class="effect" id="effect-' + led + '" data-led="' + led + '" aria-label="' + led + '效果">' +
+        '<option value="off">关闭</option><option value="on">常亮</option>' +
+        '<option value="breath">呼吸</option><option value="blink">闪烁</option>' +
+        '<option value="chase">跑马灯</option><option value="auto">自动</option></select>' +
         '<div class="tgl3" data-led="' + led + '"><div class="trk3"><div class="thm3"></div></div>' +
         '<span class="tlbl3"></span></div></div>';
       grid.appendChild(bay);
@@ -172,8 +187,30 @@
     });
     document.querySelectorAll('.dbay, .sys-card.sitem').forEach((el) => {
       el.onclick = (e) => {
-        if (e.target.closest('.tgl3,.cpick,.brit,.preset')) return;
+        if (e.target.closest('.tgl3,.cpick,.brit,.preset,.effect')) return;
         cycleMode(el.dataset.led);
+      };
+    });
+    document.querySelectorAll('.effect').forEach((sel) => {
+      sel.dataset.prev = sel.value;
+      sel.onchange = () => {
+        const val = sel.value;
+        // 跑马灯为演示模式，需确认开启
+        if (val === 'chase' && !confirm('跑马灯为演示模式，将循环闪烁所有磁盘灯，继续？')) {
+          sel.value = sel.dataset.prev;
+          return;
+        }
+        // TODO(Wave 5): 后端实现 breath/blink/chase 效果；当前经 /api/control 传递 action
+        api('POST', '/api/control', { led: sel.dataset.led, action: val }).then((r) => {
+          if (r.success) {
+            sel.dataset.prev = val;
+            updateUI(sel.dataset.led, val);
+            toast(sel.dataset.led + ' → ' + (EFFECT_LABELS[val] || val));
+          } else {
+            sel.value = sel.dataset.prev;
+            toast(r.message || '设置失败', 'err');
+          }
+        });
       };
     });
     document.querySelectorAll('.cpick').forEach((cp) => {
@@ -209,7 +246,23 @@
     const ab = document.getElementById('activity-blink');
     if (ab) {
       ab.onchange = () => api('POST', '/api/activity-blink', { enabled: ab.checked }).then((r) => {
+        if (r.success) {
+          const sb = document.getElementById('speed-blink');
+          if (sb) sb.checked = ab.checked;
+        }
         toast(r.success ? (ab.checked ? '活动闪烁已开启' : '活动闪烁已关闭，仅事件驱动') : r.message, r.success ? 'ok' : 'err');
+      });
+    }
+
+    // 速度感知：Todo 22 新增；当前对接 /api/activity-blink，Wave 5 若拆分为独立 IO 速率感知 API 再切换
+    const sb = document.getElementById('speed-blink');
+    if (sb) {
+      sb.onchange = () => api('POST', '/api/activity-blink', { enabled: sb.checked }).then((r) => {
+        if (r.success) {
+          const ab = document.getElementById('activity-blink');
+          if (ab) ab.checked = sb.checked;
+        }
+        toast(r.success ? (sb.checked ? '速度感知已开启' : '速度感知已关闭') : r.message, r.success ? 'ok' : 'err');
       });
     }
 
@@ -236,6 +289,47 @@
         if (r.success) { dlg.close(); location.href = '/login'; }
       });
     };
+
+    bindCalibrate();
+  }
+
+  function bindCalibrate() {
+    const calDlg = document.getElementById('cal-dialog');
+    const list = document.getElementById('cal-list');
+    if (!calDlg || !list) return;
+    document.getElementById('btn-calibrate').onclick = () => { buildCalList(list); calDlg.showModal(); };
+    const close = () => calDlg.close();
+    document.getElementById('cal-cancel').onclick = close;
+    document.getElementById('cal-close').onclick = close;
+  }
+
+  function buildCalList(list) {
+    list.innerHTML = '';
+    leds.filter((l) => l.startsWith('disk')).forEach((led) => {
+      const n = led.replace(/^disk/, '');
+      const row = document.createElement('div');
+      row.className = 'cal-row';
+      row.innerHTML =
+        '<span class="cal-slot">盘位 ' + n + '</span>' +
+        '<button type="button" class="abtn s cal-id" data-led="' + led + '">识别</button>' +
+        '<input type="text" class="cal-hctl" data-led="' + led + '" placeholder="HCTL 如 0:0:0:0" spellcheck="false">' +
+        '<button type="button" class="abtn a cal-bind" data-led="' + led + '">绑定</button>';
+      list.appendChild(row);
+      row.querySelector('.cal-id').onclick = () => {
+        // TODO(Wave 6, Todo 20): 后端实现 /api/calibrate/identify 点亮对应盘位 LED
+        api('POST', '/api/calibrate/identify', { led }).then((r) => {
+          toast(r.success ? '盘位 ' + n + ' LED 已点亮识别' : (r.message || '识别失败'), r.success ? 'ok' : 'err');
+        });
+      };
+      row.querySelector('.cal-bind').onclick = () => {
+        const hctl = row.querySelector('.cal-hctl').value.trim();
+        if (!hctl) { toast('请输入 HCTL', 'err'); return; }
+        // TODO(Wave 6, Todo 20): 后端实现 /api/calibrate/bind 写入 slot → hctl 映射
+        api('POST', '/api/calibrate/bind', { slot: led, hctl }).then((r) => {
+          toast(r.success ? '盘位 ' + n + ' 已绑定 ' + hctl : (r.message || '绑定失败'), r.success ? 'ok' : 'err');
+        });
+      };
+    });
   }
 
   function connectSSE() {

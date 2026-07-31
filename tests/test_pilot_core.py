@@ -182,6 +182,107 @@ class TestSetColorOffSemantics(unittest.TestCase):
             'power', '-on', '-color', '0', '255', '0', '-brightness', '255')
 
 
+class TestBreathEffect(unittest.TestCase):
+    """F7a (Todo 16): hardware-native breath mode with color/brightness."""
+
+    def _make_ctrl(self):
+        run = MagicMock(return_value=(True, '', ''))
+        return PilotController(
+            ['power', 'netdev', 'disk1', 'disk2'],
+            run, '/tmp/test_state.json', '/tmp/test_settings.json',
+            disk_count=2,
+        )
+
+    def test_breath_blue_applies_full_cli(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_mode('power', 'on')
+        ctrl.set_effect('power', 'breath')
+        ctrl.run.reset_mock()
+        ok, msg = ctrl.set_color('power', 0, 0, 255)
+        self.assertTrue(ok)
+        self.assertEqual(msg, 'OK')
+        ctrl.run.assert_called_once_with(
+            'power', '-breath', '800', '1200',
+            '-color', '0', '0', '255', '-brightness', '255')
+
+    def test_set_effect_breath_triggers_cli(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_mode('power', 'on')
+        ctrl.run.reset_mock()
+        ctrl.set_effect('power', 'breath')
+        ctrl.run.assert_called_once_with(
+            'power', '-breath', '800', '1200',
+            '-color', '255', '255', '255', '-brightness', '255')
+
+    def test_breath_timing_change_retriggers_cli(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_mode('power', 'on')
+        ctrl.set_effect('power', 'breath')
+        ctrl.run.reset_mock()
+        ctrl.set_effect('power', 'breath', t_on=500, t_off=800)
+        ctrl.run.assert_called_once_with(
+            'power', '-breath', '500', '800',
+            '-color', '255', '255', '255', '-brightness', '255')
+
+    def test_breath_to_off_calls_off_and_keeps_state(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_mode('power', 'on')
+        ctrl.set_color('power', 0, 0, 255)
+        ctrl.set_effect('power', 'breath', t_on=500, t_off=800)
+        ctrl.run.reset_mock()
+        ok, msg = ctrl.set_mode('power', 'off')
+        self.assertTrue(ok)
+        self.assertEqual(msg, 'OK')
+        ctrl.run.assert_called_once_with('power', '-off')
+        self.assertEqual(ctrl.settings['power']['color'], [0, 0, 255])
+        self.assertEqual(ctrl.settings['power']['breath_t_on'], 500)
+        self.assertEqual(ctrl.settings['power']['breath_t_off'], 800)
+        self.assertEqual(ctrl.effects['power'], 'breath')
+
+    def test_effect_off_mode_stored_without_cli(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes['power'] = 'off'
+        ok, msg = ctrl.set_effect('power', 'breath', t_on=400, t_off=900)
+        self.assertTrue(ok)
+        self.assertEqual(msg, 'OK')
+        ctrl.run.assert_not_called()
+        self.assertEqual(ctrl.effects['power'], 'breath')
+        self.assertEqual(ctrl.settings['power']['breath_t_on'], 400)
+        self.assertEqual(ctrl.settings['power']['breath_t_off'], 900)
+        # switching on later applies breath with the stored timing
+        ctrl.run.reset_mock()
+        ok, msg = ctrl.set_mode('power', 'on')
+        self.assertTrue(ok)
+        ctrl.run.assert_called_once_with(
+            'power', '-breath', '400', '900',
+            '-color', '255', '255', '255', '-brightness', '255')
+
+    def test_breath_dedup_same_params_skips_cli(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_mode('power', 'on')
+        ctrl.set_effect('power', 'breath')
+        ctrl.run.reset_mock()
+        ok1, _ = ctrl._apply('power', 'on', False)
+        ok2, _ = ctrl._apply('power', 'on', False)
+        self.assertTrue(ok1 and ok2)
+        ctrl.run.assert_not_called()
+
+    def test_manual_blink_effect(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_mode('power', 'on')
+        ctrl.run.reset_mock()
+        ctrl.set_effect('power', 'manual-blink')
+        ctrl.run.assert_called_once_with(
+            'power', '-on', '-blink', '80', '120',
+            '-color', '255', '255', '255', '-brightness', '255')
+
+    def test_invalid_effect_rejected(self):
+        ctrl = self._make_ctrl()
+        ok, msg = ctrl.set_effect('power', 'chase')
+        self.assertFalse(ok)
+        self.assertIn('Invalid effect', msg)
+
+
 class TestDiskIoCounterReset(unittest.TestCase):
     """Disk IO counter reset must not be treated as activity (delta=0)."""
 

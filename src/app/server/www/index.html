@@ -31,6 +31,10 @@
             <input type="checkbox" id="activity-blink" checked>
             <span>活动闪烁</span>
           </label>
+          <label class="toggle-row" title="速度感知：检测到磁盘 IO 活动时自动闪烁对应指示灯（当前对接 /api/activity-blink）">
+            <input type="checkbox" id="speed-blink" checked>
+            <span>速度感知</span>
+          </label>
           <label class="global-bright">
             <span>全局亮度</span>
             <input type="range" id="global-brightness" min="0" max="255" value="255">
@@ -57,6 +61,11 @@
             <input type="range" class="brit" data-led="power" min="0" max="255" value="255">
           </div>
           <div class="presets" data-led="power"></div>
+          <select class="effect" id="effect-power" data-led="power" aria-label="电源效果">
+            <option value="off">关闭</option><option value="on">常亮</option>
+            <option value="breath">呼吸</option><option value="blink">闪烁</option>
+            <option value="chase">跑马灯</option><option value="auto">自动</option>
+          </select>
           <div class="tgl3" data-led="power"><div class="trk3"><div class="thm3"></div></div><span class="tlbl3"></span></div>
         </article>
         <article class="sys-card sitem" data-led="netdev">
@@ -70,6 +79,11 @@
             <input type="range" class="brit" data-led="netdev" min="0" max="255" value="255">
           </div>
           <div class="presets" data-led="netdev"></div>
+          <select class="effect" id="effect-netdev" data-led="netdev" aria-label="网络效果">
+            <option value="off">关闭</option><option value="on">常亮</option>
+            <option value="breath">呼吸</option><option value="blink">闪烁</option>
+            <option value="chase">跑马灯</option><option value="auto">自动</option>
+          </select>
           <div class="tgl3" data-led="netdev"><div class="trk3"><div class="thm3"></div></div><span class="tlbl3"></span></div>
         </article>
       </section>
@@ -87,6 +101,7 @@
       <div class="fbar">
         <button class="abtn s" id="btn-cpw">改密</button>
         <button class="abtn a" id="btn-remap">重映射盘位</button>
+        <button class="abtn a" id="btn-calibrate">盘位校准</button>
         <button class="abtn a" id="btn-save">保存</button>
         <button class="abtn s" id="btn-logout">退出</button>
         <button class="abtn d" id="btn-reset">重置</button>
@@ -104,6 +119,18 @@
         <button type="submit" class="abtn p">保存</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="cal-dialog">
+    <div class="cal-head">
+      <h3>盘位校准</h3>
+      <button type="button" class="abtn s" id="cal-close">×</button>
+    </div>
+    <p class="cal-hint">逐灯识别：点击「识别」对应磁盘灯会点亮/闪烁以确认物理盘位，随后填写该盘位的 HCTL（如 0:0:0:0）并绑定。</p>
+    <div id="cal-list"></div>
+    <div class="dialog-actions">
+      <button type="button" class="abtn s" id="cal-cancel">关闭</button>
+    </div>
   </dialog>
 
   <div class="toast" id="toast" role="status"></div>

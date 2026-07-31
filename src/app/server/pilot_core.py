@@ -11,6 +11,7 @@ from utils import load_json, save_json
 from uevent_watcher import UeventWatcher
 
 VALID_MODES = ['off', 'on', 'auto']
+VALID_EFFECTS = ['breath', 'manual-blink']
 MAX_DISK_LEDS = 4
 LED_BASE = ['power', 'netdev']
 LED_STATUS_RE = re.compile(
@@ -29,6 +30,8 @@ DXP4800_PLUS_PROFILE = {
 
 BLINK_ON_MS = 80
 BLINK_OFF_MS = 120
+BREATH_ON_MS = 800
+BREATH_OFF_MS = 1200
 ACTIVITY_IO_THRESHOLD = 1
 SETTINGS_SAVE_DELAY = 0.8
 ACTIVITY_FAST_INTERVAL = 0.5
@@ -362,6 +365,7 @@ class PilotController:
         self.activity_blink_enabled = bool(activity_blink)
         self.modes = {}
         self.activity = {}
+        self.effects = {}
         self.presence = {}
         self.settings = self._load_settings()
         self._disk_map = {}
@@ -442,6 +446,30 @@ class PilotController:
             brightness = max(0, min(255, int(brightness)))
             self.settings.setdefault(led, {})['brightness'] = brightness
             self._schedule_settings_save()
+            mode = self.modes.get(led, 'off')
+            if mode != 'off':
+                ok, err = self._apply(led, mode, self.activity.get(led, False))
+                self._notify()
+                return ok, err
+            return True, 'OK'
+
+    def set_effect(self, led, effect, t_on=None, t_off=None):
+        with self._lock:
+            if led not in self.leds:
+                return False, f'Invalid LED: {led}'
+            if effect is not None and effect not in VALID_EFFECTS:
+                return False, f'Invalid effect: {effect}'
+            if effect is None:
+                self.effects.pop(led, None)
+            else:
+                self.effects[led] = effect
+            if effect == 'breath':
+                if t_on is not None:
+                    self.settings.setdefault(led, {})['breath_t_on'] = max(0, int(t_on))
+                    self._schedule_settings_save()
+                if t_off is not None:
+                    self.settings.setdefault(led, {})['breath_t_off'] = max(0, int(t_off))
+                    self._schedule_settings_save()
             mode = self.modes.get(led, 'off')
             if mode != 'off':
                 ok, err = self._apply(led, mode, self.activity.get(led, False))
@@ -544,9 +572,12 @@ class PilotController:
         self._disk_sig = disk_signature()
         self._net_sig = net_signature()
 
-    def _apply_key(self, led, mode, activity):
+    def _apply_key(self, led, mode, activity, effect=None, t_on=None, t_off=None):
         cfg = self.get_settings(led)
-        return (mode, activity, tuple(cfg['color']), cfg['brightness'])
+        if effect == 'breath':
+            return (mode, activity, effect, t_on, t_off,
+                    tuple(cfg['color']), cfg['brightness'])
+        return (mode, activity, effect, tuple(cfg['color']), cfg['brightness'])
 
     def restore_state(self, hardware_modes=None, apply_hardware=True):
         hardware_modes = hardware_modes or {}
@@ -604,7 +635,13 @@ class PilotController:
             return True, 'OK'
 
     def _apply(self, led, mode, activity=False):
-        key = self._apply_key(led, mode, activity)
+        effect = self.effects.get(led)
+        t_on = t_off = None
+        if effect == 'breath':
+            cfg0 = self.get_settings(led)
+            t_on = cfg0.get('breath_t_on', BREATH_ON_MS)
+            t_off = cfg0.get('breath_t_off', BREATH_OFF_MS)
+        key = self._apply_key(led, mode, activity, effect, t_on, t_off)
         if self._last_applied.get(led) == key:
             return True, 'OK'
 
@@ -614,6 +651,16 @@ class PilotController:
 
         if mode == 'off':
             ok, _, err = self.run(led, '-off')
+        elif effect == 'breath':
+            ok, _, err = self.run(
+                led, '-breath', str(t_on), str(t_off),
+                '-color', cr, cg, cb, '-brightness', brightness,
+            )
+        elif effect == 'manual-blink':
+            ok, _, err = self.run(
+                led, '-on', '-blink', str(BLINK_ON_MS), str(BLINK_OFF_MS),
+                '-color', cr, cg, cb, '-brightness', brightness,
+            )
         elif mode == 'on':
             ok, _, err = self.run(led, '-on', '-color', cr, cg, cb, '-brightness', brightness)
         elif not self._is_present(led):

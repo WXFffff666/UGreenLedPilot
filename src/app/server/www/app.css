@@ -210,8 +210,21 @@ body {
     0 0 10px rgba(255, 176, 32, 0.6), 0 0 24px rgba(255, 176, 32, 0.25);
   animation: blink 0.35s infinite;
 }
+.led.breath {
+  background: radial-gradient(circle at 30% 30%, #8dffde, var(--accent) 45%, #007a55);
+  box-shadow: inset 0 1px 2px rgba(255, 255, 255, 0.55), inset 0 -2px 4px rgba(0, 0, 0, 0.35),
+    0 0 10px rgba(0, 229, 160, 0.6), 0 0 24px rgba(0, 229, 160, 0.25);
+  animation: breath 2.2s ease-in-out infinite;
+}
+.led.chase {
+  background: radial-gradient(circle at 30% 30%, #ffe3a3, var(--warn) 45%, #aa6600);
+  box-shadow: inset 0 1px 2px rgba(255, 255, 255, 0.55), inset 0 -2px 4px rgba(0, 0, 0, 0.35),
+    0 0 10px rgba(255, 176, 32, 0.6), 0 0 24px rgba(255, 176, 32, 0.25);
+  animation: blink 0.25s infinite;
+}
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.15; } }
+@keyframes breath { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
 .tgl3 {
   display: flex; flex-direction: column; align-items: center;
@@ -266,6 +279,28 @@ input[type='range']::-moz-range-thumb {
   transition: transform 0.1s;
 }
 .preset:hover { transform: scale(1.15); }
+
+/* 效果选择器：玻璃下拉，与面板统一 */
+.effect {
+  width: 100%;
+  margin: 4px 0 6px;
+  padding: 7px 26px 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--edge);
+  background-color: rgba(6, 10, 16, 0.8);
+  color: var(--t1);
+  font-size: 12px;
+  cursor: pointer;
+  -webkit-appearance: none; appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%239aa8bc' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  box-shadow: var(--hi);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.effect:hover { border-color: var(--edge-hi); }
+.effect:focus-visible { outline: 2px solid var(--accent2); outline-offset: 1px; }
+.effect option { background: #0c121c; color: var(--t1); }
 
 .dsection { padding: 4px 20px 18px; }
 .dtitle { font-size: 11px; color: var(--t3); letter-spacing: 1px; margin-bottom: 12px; font-weight: 500; }
@@ -334,6 +369,30 @@ dialog input {
 }
 .dialog-actions { display: flex; gap: 8px; margin-top: 14px; }
 
+/* 盘位校准对话框 */
+#cal-dialog { width: min(480px, 94vw); }
+.cal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+.cal-head h3 { margin-bottom: 0; }
+#cal-close { flex: 0 0 auto; min-width: 36px; padding: 6px 12px; font-size: 14px; line-height: 1; }
+.cal-hint { font-size: 12px; color: var(--t2); line-height: 1.6; margin-bottom: 12px; }
+#cal-list { display: flex; flex-direction: column; }
+.cal-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 0; border-bottom: 1px solid var(--edge);
+}
+.cal-row:last-child { border-bottom: none; }
+.cal-slot { font-size: 12px; font-weight: 600; color: var(--t1); width: 58px; flex-shrink: 0; }
+.cal-row .abtn { flex: 0 0 auto; min-width: 56px; padding: 8px 10px; }
+#cal-dialog input.cal-hctl {
+  flex: 1; min-width: 0; margin: 0;
+  padding: 9px 10px; border-radius: 8px;
+  border: 1px solid var(--edge);
+  background: rgba(6, 10, 16, 0.8); color: var(--t1);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+#cal-dialog input.cal-hctl:focus { border-color: var(--edge-hi); outline: none; box-shadow: 0 0 0 1px var(--edge-hi); }
+
 .login-page { display: grid; place-items: center; padding: 40px 20px; min-height: 100vh; }
 .login-wrap { width: min(360px, 100%); }
 .login-box {
@@ -382,6 +441,9 @@ dialog input {
   .tgl3.st2 .thm3 { transform: translateX(22px); }
   .presence { font-size: 9px; padding: 2px 7px; }
   .led { width: 16px; height: 16px; }
+  .cal-slot { width: 46px; }
+  .cal-row .abtn { min-width: 48px; padding: 7px 8px; }
+  #cal-dialog input.cal-hctl { font-size: 11px; }
 }
 
 /* 窄手机：磁盘网格降为 1 列，避免色板行最小宽度撑破 2 列 */
