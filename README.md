@@ -101,6 +101,11 @@ src/app/server/
 - 应用用户已加入 `i2c` 组，或 CLI 已配置 setuid
 - 若系统自带 `led_ugreen` 内核模块与 CLI 冲突，需先卸载
 
+### 升级说明
+
+- **全新安装**：data-share 使用新名 `UGreenLedPilot`。
+- **从旧版本升级**：保留旧数据目录 `FnUGreenLed`（不删除、不迁移），升级后应用继续沿用旧数据。
+
 ---
 
 ## 构建

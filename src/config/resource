@@ -4,7 +4,7 @@
         "shares":
         [
             {
-                "name": "FnUGreenLed",
+                "name": "UGreenLedPilot",
                 "permission":
                 {
                     "rw":
@@ -14,7 +14,7 @@
                 }
             },
             {
-                "name": "FnUGreenLed/data",
+                "name": "UGreenLedPilot/data",
                 "permission":
                 {
                     "rw":

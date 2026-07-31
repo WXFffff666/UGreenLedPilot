@@ -7,7 +7,7 @@ SYSTEM_CLI="/usr/local/bin/ugreen_leds_cli"
 echo "=== UGreenLedPilot Install Init ==="
 
 # --- 1. Load i2c-dev kernel module ---
-echo "[1/5] Loading i2c-dev kernel module..."
+echo "[1/4] Loading i2c-dev kernel module..."
 if lsmod | grep -q i2c_dev; then
     echo "  i2c-dev already loaded"
 elif modprobe i2c-dev 2>/dev/null; then
@@ -17,7 +17,7 @@ else
 fi
 
 # --- 2. Add app user to i2c group (group-based access, no root needed) ---
-echo "[2/5] Configuring I2C group access..."
+echo "[2/4] Configuring I2C group access..."
 APP_USER="${TRIM_USERNAME:-ledcontroller}"
 if getent group i2c > /dev/null 2>&1; then
     if id -nG "$APP_USER" 2>/dev/null | grep -qw i2c; then
@@ -31,18 +31,13 @@ else
     echo "  No i2c group found on this system"
 fi
 
-# --- 3. Make binary setuid root as fallback ---
-echo "[3/5] Configuring CLI binary..."
-for CLI in "$BUNDLED_CLI" "$SYSTEM_CLI"; do
-    if [ -f "$CLI" ]; then
-        chown root:root "$CLI" 2>/dev/null
-        chmod u+s "$CLI" 2>/dev/null
-        echo "  Setuid configured: $CLI"
-    fi
-done
+# Note: CLI binary intentionally NOT made setuid root. The app declares
+# run-as: root in its privilege config, so the setuid bit is redundant and
+# would add an unnecessary privilege-escalation surface (any local user
+# could execute the CLI as root). I2C group access above is the fallback.
 
-# --- 4. Verify I2C devices ---
-echo "[4/5] Checking I2C devices..."
+# --- 3. Verify I2C devices ---
+echo "[3/4] Checking I2C devices..."
 if ls /dev/i2c-* 2>/dev/null; then
     echo "  I2C devices found"
 else
@@ -51,7 +46,7 @@ else
 fi
 
 # --- Save original LED state for uninstall restore ---
-echo "[5/5] Saving original LED state..."
+echo "[4/4] Saving original LED state..."
 for CLI_PATH in "$BUNDLED_CLI" "$SYSTEM_CLI"; do
     if [ -f "$CLI_PATH" ] && [ -x "$CLI_PATH" ]; then
         STATE_FILE="${TRIM_PKGVAR}/original_led_state.txt"

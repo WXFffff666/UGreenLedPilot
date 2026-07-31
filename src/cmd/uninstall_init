@@ -8,7 +8,7 @@ STATE_FILE="${TRIM_PKGVAR}/original_led_state.txt"
 CLI="/usr/local/bin/ugreen_leds_cli"
 BUNDLED="${TRIM_APPDEST}/server/ugreen_leds_cli"
 
-echo "=== FnUGreenLed Uninstall — Restoring Original LED State ==="
+echo "=== UGreenLedPilot Uninstall — Restoring Original LED State ==="
 
 # Find a working CLI binary
 CLI_PATH=""
