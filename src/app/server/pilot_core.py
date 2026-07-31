@@ -270,15 +270,16 @@ def disk_signature():
 
 
 def net_signature():
-    iface = detect_net_iface()
-    carrier = ''
-    if iface:
+    keys = []
+    for iface in list_net_ifaces():
+        carrier = ''
         try:
             with open(f'/sys/class/net/{iface}/carrier') as f:
                 carrier = f.read().strip()
         except IOError:
             pass
-    return iface or '', carrier
+        keys.append((iface, carrier))
+    return tuple(keys)
 
 
 def quick_hardware_signature():
@@ -365,8 +366,9 @@ class PilotController:
         self.settings = self._load_settings()
         self._disk_map = {}
         self._net_iface = None
-        self._prev_net_rx = 0
-        self._prev_net_tx = 0
+        self._net_ifaces = []
+        self._prev_net_rx = {}
+        self._prev_net_tx = {}
         self._prev_disk_io = {}
         self._disk_sig = None
         self._net_sig = None
@@ -552,6 +554,7 @@ class PilotController:
             saved = load_json(self.state_file, {})
             self._disk_map = detect_disks(self.ata_map, self.hctl_map, self.disk_count)
             self._net_iface = detect_net_iface()
+            self._net_ifaces = list_net_ifaces()
             self._refresh_signatures()
             self._update_presence()
             for led in self.leds:
@@ -640,16 +643,19 @@ class PilotController:
         with self._lock:
             self._disk_map = detect_disks(self.ata_map, self.hctl_map, self.disk_count)
             self._net_iface = detect_net_iface()
+            self._net_ifaces = list_net_ifaces()
             self._refresh_signatures()
             self._update_presence()
         print(f'DXP4800 Plus — Disks: {self._disk_map}, Network: {self._net_iface or "none"}')
         tier = self._monitor_tier()
         print(f'Monitor tier: {tier} (hotplug={"on" if self.needs_hotplug_monitor() else "off"})')
 
-        if self._net_iface:
-            base = f'/sys/class/net/{self._net_iface}/statistics'
-            self._prev_net_rx = read_stats(f'{base}/rx_bytes')
-            self._prev_net_tx = read_stats(f'{base}/tx_bytes')
+        self._prev_net_rx = {}
+        self._prev_net_tx = {}
+        for iface in self._net_ifaces:
+            base = f'/sys/class/net/{iface}/statistics'
+            self._prev_net_rx[iface] = read_stats(f'{base}/rx_bytes')
+            self._prev_net_tx[iface] = read_stats(f'{base}/tx_bytes')
         for slot, dev in self._disk_map.items():
             if disk_present(dev):
                 self._prev_disk_io[slot] = read_disk_io(f'/sys/block/{dev}/stat')
@@ -670,6 +676,7 @@ class PilotController:
         old_map = dict(self._disk_map)
         self._disk_map = detect_disks(self.ata_map, self.hctl_map, self.disk_count)
         self._net_iface = detect_net_iface()
+        self._net_ifaces = list_net_ifaces()
         self._update_presence()
         self._rescan_count += 1
         print(f'Hotplug remap #{self._rescan_count}: {old_map} -> {self._disk_map}, net={self._net_iface}')
@@ -688,10 +695,12 @@ class PilotController:
             if disk_present(dev) and slot not in self._prev_disk_io:
                 self._prev_disk_io[slot] = read_disk_io(f'/sys/block/{dev}/stat')
 
-        if self._net_iface:
-            base = f'/sys/class/net/{self._net_iface}/statistics'
-            self._prev_net_rx = read_stats(f'{base}/rx_bytes')
-            self._prev_net_tx = read_stats(f'{base}/tx_bytes')
+        self._prev_net_rx = {}
+        self._prev_net_tx = {}
+        for iface in self._net_ifaces:
+            base = f'/sys/class/net/{iface}/statistics'
+            self._prev_net_rx[iface] = read_stats(f'{base}/rx_bytes')
+            self._prev_net_tx[iface] = read_stats(f'{base}/tx_bytes')
 
     def _maybe_rescan(self):
         if not self.needs_hotplug_monitor():
@@ -769,12 +778,16 @@ class PilotController:
                 self._apply(led, 'auto', activity=False)
                 return True
             return False
-        base = f'/sys/class/net/{self._net_iface}/statistics'
-        rx = read_stats(f'{base}/rx_bytes')
-        tx = read_stats(f'{base}/tx_bytes')
-        delta = (rx - self._prev_net_rx) + (tx - self._prev_net_tx)
+        delta = 0
+        for iface in self._net_ifaces:
+            base = f'/sys/class/net/{iface}/statistics'
+            rx = read_stats(f'{base}/rx_bytes')
+            tx = read_stats(f'{base}/tx_bytes')
+            # unseeded (new) iface contributes 0 on first sight — no false activity
+            delta += (rx - self._prev_net_rx.get(iface, rx)) + (tx - self._prev_net_tx.get(iface, tx))
+            self._prev_net_rx[iface] = rx
+            self._prev_net_tx[iface] = tx
         active = delta >= ACTIVITY_IO_THRESHOLD
-        self._prev_net_rx, self._prev_net_tx = rx, tx
         if active != self.activity.get(led):
             self.activity[led] = active
             self._apply(led, 'auto', activity=active)
@@ -816,6 +829,7 @@ class PilotController:
                 'activity': dict(self.activity),
                 'presence': dict(self.presence),
                 'net_iface': self._net_iface,
+                'net_ifaces': list(self._net_ifaces),
                 'hotplug_monitor': self.needs_hotplug_monitor(),
                 'monitor_tier': self._monitor_tier(),
                 'activity_blink': self.activity_blink_enabled,
@@ -832,6 +846,7 @@ class PilotController:
                 'settings': {k: dict(v) for k, v in self.settings.items() if k in self.leds},
                 'disk_map': {str(k): v for k, v in self._disk_map.items()},
                 'net_iface': self._net_iface,
+                'net_ifaces': list(self._net_ifaces),
                 'leds': self.leds,
                 'presets': COLOR_PRESETS,
                 'hotplug_monitor': self.needs_hotplug_monitor(),

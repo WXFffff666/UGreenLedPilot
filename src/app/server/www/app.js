@@ -58,8 +58,9 @@
     }
     const pres = document.getElementById(led + '-presence');
     if (pres && present !== undefined) {
-      pres.textContent = present ? '已连接' : '未连接';
-      pres.className = 'presence ' + (present ? 'on' : 'off');
+      const act = present && mode === 'auto' && activity;
+      pres.textContent = act ? '活动' : (present ? '已连接' : '未连接');
+      pres.className = 'presence ' + (act ? 'active' : (present ? 'on' : 'off'));
     }
     const bay = document.querySelector('.dbay[data-led="' + led + '"]');
     if (bay) bay.classList.toggle('active', mode !== 'off');

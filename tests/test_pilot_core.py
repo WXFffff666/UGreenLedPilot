@@ -13,12 +13,12 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src' / 'app' / 'server'))
 
 from pilot_core import (
-    map_disks_by_profile, disk_signature, net_signature,
+    map_disks_by_profile, disk_signature, net_signature, list_net_ifaces,
     quick_hardware_signature, DEFAULT_SETTINGS, NETDEV_ORANGE, WHITE,
     DXP4800_PLUS_PROFILE, PilotController, StatusBroadcaster,
 )
@@ -225,6 +225,107 @@ class TestDiskIoCounterReset(unittest.TestCase):
         with patch('pilot_core.disk_present', return_value=False):
             self.assertFalse(ctrl._check_disks())
         self.assertNotIn(1, ctrl._prev_disk_io)
+
+
+class TestMultiNicMonitoring(unittest.TestCase):
+    """E13/F2: aggregate rx/tx across all NICs (DXP4800 Plus dual 2.5G)."""
+
+    def _make_ctrl(self):
+        run = MagicMock(return_value=(True, '', ''))
+        return PilotController(
+            ['power', 'netdev', 'disk1', 'disk2'],
+            run, '/tmp/test_state.json', '/tmp/test_settings.json',
+            disk_count=2,
+        )
+
+    def test_any_nic_traffic_triggers_active(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes['netdev'] = 'auto'
+        ctrl._net_iface = 'eth0'
+        ctrl._net_ifaces = ['eth0', 'eth1']
+        ctrl._prev_net_rx = {'eth0': 1000, 'eth1': 500}
+        ctrl._prev_net_tx = {'eth0': 2000, 'eth1': 600}
+        ctrl.activity['netdev'] = False
+        # eth0 idle; only eth1 sees traffic (rx 500 -> 550)
+        with patch('pilot_core.read_stats', side_effect=[1000, 2000, 550, 600]):
+            changed = ctrl._check_network()
+        self.assertTrue(changed)
+        self.assertTrue(ctrl.activity['netdev'])
+        self.assertTrue(any('-blink' in call.args for call in ctrl.run.call_args_list))
+        self.assertEqual(ctrl._prev_net_rx, {'eth0': 1000, 'eth1': 550})
+
+    def test_all_nics_down_activity_false_and_led_off(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes['netdev'] = 'auto'
+        ctrl._net_iface = None
+        ctrl._net_ifaces = []
+        ctrl.activity['netdev'] = True
+        with patch('pilot_core.read_stats') as mock_read:
+            changed = ctrl._check_network()
+        self.assertTrue(changed)
+        self.assertFalse(ctrl.activity['netdev'])
+        self.assertTrue(any('-off' in call.args for call in ctrl.run.call_args_list))
+        mock_read.assert_not_called()
+
+    def test_net_iface_compat_first_and_net_ifaces_all(self):
+        ctrl = self._make_ctrl()
+        with patch('pilot_core.detect_net_iface', return_value='eth0'), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0', 'eth1']), \
+                patch('pilot_core.detect_disks', return_value={}):
+            ctrl.restore_state(apply_hardware=False)
+        self.assertEqual(ctrl._net_iface, 'eth0')
+        self.assertEqual(ctrl._net_ifaces, ['eth0', 'eth1'])
+        status = ctrl.get_status()
+        self.assertEqual(status['net_iface'], 'eth0')
+        self.assertEqual(status['net_ifaces'], ['eth0', 'eth1'])
+        self.assertEqual(ctrl.get_live_status()['net_ifaces'], ['eth0', 'eth1'])
+
+    def test_start_monitor_seeds_all_ifaces(self):
+        ctrl = self._make_ctrl()
+        with patch('pilot_core.detect_net_iface', return_value='eth0'), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0', 'eth1']), \
+                patch('pilot_core.detect_disks', return_value={}), \
+                patch('pilot_core.read_stats', side_effect=[10, 20, 30, 40]):
+            ctrl.start_monitor()
+            ctrl.stop_monitor()
+        self.assertEqual(ctrl._net_iface, 'eth0')
+        self.assertEqual(ctrl._net_ifaces, ['eth0', 'eth1'])
+        self.assertEqual(ctrl._prev_net_rx, {'eth0': 10, 'eth1': 30})
+        self.assertEqual(ctrl._prev_net_tx, {'eth0': 20, 'eth1': 40})
+
+    def test_net_signature_aggregates_all_ifaces(self):
+        eth0 = mock_open(read_data='1')
+        eth1 = mock_open(read_data='0')
+        with patch('pilot_core.list_net_ifaces', return_value=['eth0', 'eth1']), \
+                patch('pilot_core.open', side_effect=[eth0.return_value, eth1.return_value]):
+            sig = net_signature()
+        self.assertEqual(sig, (('eth0', '1'), ('eth1', '0')))
+        self.assertIsInstance(sig, tuple)
+
+    def test_hotplug_unplug_one_nic_rescan_no_false_activity(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes = {'power': 'off', 'netdev': 'auto', 'disk1': 'off', 'disk2': 'off'}
+        ctrl.activity['netdev'] = False
+        ctrl._net_ifaces = ['eth0', 'eth1']
+        ctrl._net_iface = 'eth0'
+        ctrl._prev_net_rx = {'eth0': 1000, 'eth1': 500}
+        ctrl._prev_net_tx = {'eth0': 2000, 'eth1': 600}
+        ctrl._net_sig = (('eth0', '1'), ('eth1', '1'))
+        ctrl._disk_sig = ()
+        # eth1 unplugged -> carrier gone -> net signature changes -> rescan
+        with patch('pilot_core.detect_disks', return_value={}), \
+                patch('pilot_core.disk_signature', return_value=()), \
+                patch('pilot_core.net_signature', return_value=(('eth0', '1'),)), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'), \
+                patch('pilot_core.read_stats', side_effect=[1100, 2100, 1100, 2100]):
+            self.assertTrue(ctrl._maybe_rescan())
+            # reseeded prev counters -> stale eth1 counters must not cause activity
+            self.assertFalse(ctrl._check_network())
+        self.assertFalse(ctrl.activity['netdev'])
+        self.assertEqual(ctrl._net_ifaces, ['eth0'])
+        self.assertNotIn('eth1', ctrl._prev_net_rx)
+        self.assertFalse(any('-blink' in call.args for call in ctrl.run.call_args_list))
 
 
 class TestBroadcaster(unittest.TestCase):
