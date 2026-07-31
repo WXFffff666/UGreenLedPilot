@@ -21,7 +21,7 @@ start_process() {
 
     log_msg "Starting process ..."
     log_msg "Command: ${CMD}"
-    nohup bash -c "${CMD}" >> "${LOG_FILE}" 2>&1 &
+    nohup python3 ${TRIM_APPDEST}/server/main.py >> "${LOG_FILE}" 2>&1 &
     printf "%s" "$!" > ${PID_FILE}
     return 0
 }
