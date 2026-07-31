@@ -553,6 +553,28 @@ class PilotController:
                 return ok, err
             return True, 'OK'
 
+    def identify(self, led):
+        """Locate an LED by blinking it with its current color (F8, Todo 20).
+
+        Runs inside the controller lock — unlike the old handler-level run()
+        call which bypassed it (F2 finding 4) — and records the manual-blink
+        apply key so a later _apply of the same blink state is deduped.
+        """
+        with self._lock:
+            if led not in self.leds:
+                return False, f'Invalid LED: {led}'
+            cfg = self.get_settings(led)
+            cr, cg, cb = map(str, cfg['color'])
+            brightness = str(cfg['brightness'])
+            ok, _, err = self.run(
+                led, '-on', '-blink', str(MANUAL_BLINK_ON_MS), str(MANUAL_BLINK_OFF_MS),
+                '-color', cr, cg, cb, '-brightness', brightness,
+            )
+            if ok:
+                self._last_applied[led] = self._apply_key(
+                    led, 'on', False, effect='manual-blink')
+            return ok, err or 'OK'
+
     def set_global_brightness(self, brightness):
         with self._lock:
             brightness = max(0, min(255, int(brightness)))
@@ -753,6 +775,9 @@ class PilotController:
 
     def all_off(self):
         with self._lock:
+            # F2 (Todo 18): stop the chase demo first — otherwise the monitor
+            # loop would keep stepping and re-light the LEDs after the batch off
+            self._disable_chase()
             ok, _, err = self.run('all', '-off')
             if not ok:
                 return False, err or 'OK'
@@ -1085,6 +1110,7 @@ class PilotController:
                 'modes': dict(self.modes),
                 'activity': dict(self.activity),
                 'presence': dict(self.presence),
+                'effects': dict(self.effects),
                 'net_iface': self._net_iface,
                 'net_ifaces': list(self._net_ifaces),
                 'hotplug_monitor': self.needs_hotplug_monitor(),
@@ -1101,6 +1127,7 @@ class PilotController:
                 'modes': dict(self.modes),
                 'activity': dict(self.activity),
                 'presence': dict(self.presence),
+                'effects': dict(self.effects),
                 'settings': {k: dict(v) for k, v in self.settings.items() if k in self.leds},
                 'disk_map': {str(k): v for k, v in self._disk_map.items()},
                 'net_iface': self._net_iface,

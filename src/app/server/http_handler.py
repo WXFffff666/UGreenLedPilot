@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler
 from urllib.parse import unquote, urlparse
 
 from app_context import APP_VERSION, CONFIG_FILE, WWW_DIR
-from pilot_core import VALID_MODES, MANUAL_BLINK_ON_MS, MANUAL_BLINK_OFF_MS
+from pilot_core import VALID_MODES, VALID_EFFECTS
 from utils import remove_file, save_json
 
 MAX_BODY_BYTES = 65536
@@ -145,6 +145,9 @@ class PilotHandler(BaseHTTPRequestHandler):
             '/api/change-password': lambda: self._change_password(data),
             '/api/remap': self._remap,
             '/api/activity-blink': lambda: self._activity_blink(data),
+            '/api/effect': lambda: self._effect(data),
+            '/api/chase': lambda: self._chase(data),
+            '/api/speed-blink': lambda: self._speed_blink(data),
             '/api/calibrate/identify': lambda: self._calibrate_identify(data),
             '/api/calibrate/bind': lambda: self._calibrate_bind(data),
             '/api/all/off': lambda: self._all('off'),
@@ -305,6 +308,46 @@ class PilotHandler(BaseHTTPRequestHandler):
         save_json(CONFIG_FILE, self.app.cfg)
         return self._json(200 if ok else 500, {'success': ok, 'message': msg})
 
+    def _effect(self, data):
+        """F1 (Todo 16): set/clear a per-LED effect (breath / manual-blink).
+
+        effect = 'off' / null / missing clears the effect; 'blink' is the
+        UI name mapped to backend 'manual-blink' (both are accepted).
+        """
+        led = data.get('led', '')
+        if not validate_led(led):
+            return self._json(400, {'success': False, 'message': '无效 LED'})
+        effect = data.get('effect')
+        if effect in (None, '', 'off'):
+            effect = None
+        elif effect == 'blink':
+            effect = 'manual-blink'
+        if effect is not None and effect not in VALID_EFFECTS:
+            return self._json(400, {'success': False, 'message': '无效效果'})
+        t_on = data.get('t_on')
+        t_off = data.get('t_off')
+        try:
+            t_on = int(t_on) if t_on is not None else None
+            t_off = int(t_off) if t_off is not None else None
+        except (TypeError, ValueError):
+            return self._json(400, {'success': False, 'message': 'Invalid timing'})
+        ok, msg = self.app.ctrl.set_effect(led, effect, t_on, t_off)
+        return self._json(200 if ok else 500, {'success': ok, 'message': msg})
+
+    def _chase(self, data):
+        """F1 (Todo 17): toggle the chase demo (running light)."""
+        enabled = bool(data.get('enabled', True))
+        ok, msg = self.app.ctrl.set_chase(enabled)
+        return self._json(200 if ok else 500, {'success': ok, 'message': msg})
+
+    def _speed_blink(self, data):
+        """F1 (Todo 17): toggle rate-aware blink, persisted to device_config."""
+        enabled = bool(data.get('enabled', True))
+        ok, msg = self.app.ctrl.set_speed_blink(enabled)
+        self.app.cfg['speed_blink'] = enabled
+        save_json(CONFIG_FILE, self.app.cfg)
+        return self._json(200 if ok else 500, {'success': ok, 'message': msg})
+
     def _remap(self):
         ok, msg = self.app.ctrl.force_remap()
         return self._json(200 if ok else 500, {
@@ -313,17 +356,15 @@ class PilotHandler(BaseHTTPRequestHandler):
         })
 
     def _calibrate_identify(self, data):
-        """F8 (Todo 20): blink the given LED so the user can locate the bay."""
+        """F8 (Todo 20): blink the given LED so the user can locate the bay.
+
+        Delegates to ctrl.identify() — the blink runs inside the controller
+        lock (F2 finding 4), never a raw run() call from the handler.
+        """
         led = data.get('led', '')
         if not validate_led(led):
             return self._json(400, {'success': False, 'message': '无效 LED'})
-        cfg = self.app.ctrl.get_settings(led)
-        cr, cg, cb = map(str, cfg['color'])
-        brightness = str(cfg['brightness'])
-        ok, _, err = self.app.ctrl.run(
-            led, '-on', '-blink', str(MANUAL_BLINK_ON_MS), str(MANUAL_BLINK_OFF_MS),
-            '-color', cr, cg, cb, '-brightness', brightness,
-        )
+        ok, err = self.app.ctrl.identify(led)
         if not ok:
             return self._json(500, {'success': False, 'message': err or '识别失败'})
         return self._json(200, {'success': True, 'message': '识别中'})

@@ -421,19 +421,18 @@ class TestCalibrate(_HandlerMixin, unittest.TestCase):
             bay_bindings=bay_bindings,
         )
 
-    def test_identify_valid_led_blinks(self):
-        self.ctrl.get_settings.return_value = {'color': [255, 255, 255], 'brightness': 255}
-        self.ctrl.run.return_value = (True, '', '')
+    def test_identify_valid_led_delegates_to_ctrl(self):
+        # F2: the handler must delegate to ctrl.identify() so the blink
+        # runs inside the controller lock, never a raw run() call.
+        self.ctrl.identify.return_value = (True, 'OK')
         handler = self.make_handler(
             path='/api/calibrate/identify', headers=self.auth_headers())
         self.post_json(handler, {'led': 'disk1'})
         status, body = handler._responses[-1]
         self.assertEqual(status, 200)
         self.assertTrue(body['success'])
-        self.ctrl.run.assert_called_once()
-        args = self.ctrl.run.call_args[0]
-        self.assertIn('disk1', args)
-        self.assertIn('-blink', args)
+        self.ctrl.identify.assert_called_once_with('disk1')
+        self.ctrl.run.assert_not_called()
 
     def test_identify_invalid_led_400(self):
         handler = self.make_handler(
@@ -442,7 +441,7 @@ class TestCalibrate(_HandlerMixin, unittest.TestCase):
         status, body = handler._responses[-1]
         self.assertEqual(status, 400)
         self.assertFalse(body['success'])
-        self.ctrl.run.assert_not_called()
+        self.ctrl.identify.assert_not_called()
 
     def test_bind_valid_hctl_200_and_persisted(self):
         cfg_path = os.path.join(self.dir, 'device_config.json')
@@ -530,6 +529,196 @@ class TestCalibrate(_HandlerMixin, unittest.TestCase):
             with open(cfg_path, encoding='utf-8') as f:
                 saved = json.load(f)
             self.assertNotIn('bay_bindings', saved)
+
+
+class TestEffectRoutes(_HandlerMixin, unittest.TestCase):
+    """F1/F2/F4 (Todo 16/17/18): effect / chase / speed-blink HTTP wiring.
+
+    The backend set_effect / set_chase / set_speed_blink methods already
+    exist; these tests lock the HTTP layer entry points that were missing
+    (rejected with 404), the all_off() chase stop, and ctrl.identify().
+    """
+
+    def make_controller(self):
+        return self._track(PilotController(
+            ['power', 'netdev', 'disk1', 'disk2'],
+            run=MagicMock(return_value=(True, '', '')),
+            state_file=os.path.join(self.dir, 'led_state.json'),
+            settings_file=os.path.join(self.dir, 'led_settings.json'),
+            disk_count=2,
+        ))
+
+    def tearDown(self):
+        # cancel pending 0.8s settings timers + stop uevent watchers so no
+        # controller threads outlive the test (same hygiene as _PilotTestCase)
+        if getattr(self, '_ctrls', None):
+            for ctrl in self._ctrls:
+                if ctrl._settings_timer:
+                    ctrl._settings_timer.cancel()
+                ctrl._uevent.stop()
+        super().tearDown()
+
+    def _track(self, ctrl):
+        if not getattr(self, '_ctrls', None):
+            self._ctrls = []
+        self._ctrls.append(ctrl)
+        return ctrl
+
+    def post_effect(self, ctrl, payload):
+        handler = self.make_handler(path='/api/effect', headers=self.auth_headers())
+        handler.app.ctrl = ctrl
+        self.post_json(handler, payload)
+        return handler
+
+    def test_effect_breath_200_runs_cli_breath(self):
+        ctrl = self.make_controller()
+        ctrl.set_mode('power', 'on')
+        ctrl.run.reset_mock()
+        handler = self.post_effect(ctrl, {'led': 'power', 'effect': 'breath'})
+        status, body = handler._responses[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(body['success'])
+        args = ctrl.run.call_args[0]
+        self.assertEqual(args[0], 'power')
+        self.assertIn('-breath', args)
+
+    def test_effect_blink_maps_to_manual_blink(self):
+        # UI option 'blink' -> backend 'manual-blink' (-blink 400 400)
+        ctrl = self.make_controller()
+        ctrl.set_mode('power', 'on')
+        ctrl.run.reset_mock()
+        handler = self.post_effect(ctrl, {'led': 'power', 'effect': 'blink'})
+        status, body = handler._responses[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(body['success'])
+        args = ctrl.run.call_args[0]
+        self.assertIn('-blink', args)
+        self.assertIn('400', args)
+
+    def test_effect_manual_blink_accepted_directly(self):
+        ctrl = self.make_controller()
+        ctrl.set_mode('power', 'on')
+        ctrl.run.reset_mock()
+        handler = self.post_effect(ctrl, {'led': 'power', 'effect': 'manual-blink'})
+        self.assertEqual(handler._responses[-1][0], 200)
+        self.assertIn('-blink', ctrl.run.call_args[0])
+
+    def test_effect_off_clears_effect(self):
+        ctrl = self.make_controller()
+        ctrl.set_mode('power', 'on')
+        ctrl.set_effect('power', 'breath')
+        ctrl.run.reset_mock()
+        handler = self.post_effect(ctrl, {'led': 'power', 'effect': 'off'})
+        status, body = handler._responses[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(body['success'])
+        self.assertNotIn('power', ctrl.effects)
+        args = ctrl.run.call_args[0]
+        self.assertNotIn('-breath', args)
+        self.assertNotIn('-blink', args)
+        self.assertIn('-on', args)
+
+    def test_effect_null_clears_effect(self):
+        ctrl = self.make_controller()
+        ctrl.set_mode('power', 'on')
+        ctrl.set_effect('power', 'breath')
+        handler = self.post_effect(ctrl, {'led': 'power', 'effect': None})
+        self.assertEqual(handler._responses[-1][0], 200)
+        self.assertNotIn('power', ctrl.effects)
+
+    def test_effect_invalid_led_400(self):
+        ctrl = self.make_controller()
+        handler = self.post_effect(ctrl, {'led': 'disk9', 'effect': 'breath'})
+        self.assertEqual(handler._responses[-1][0], 400)
+
+    def test_effect_invalid_effect_400(self):
+        ctrl = self.make_controller()
+        handler = self.post_effect(ctrl, {'led': 'power', 'effect': 'strobe'})
+        self.assertEqual(handler._responses[-1][0], 400)
+        self.assertNotIn('power', ctrl.effects)
+
+    def test_effect_invalid_timing_400(self):
+        ctrl = self.make_controller()
+        handler = self.post_effect(ctrl, {'led': 'power', 'effect': 'breath', 't_on': 'x'})
+        self.assertEqual(handler._responses[-1][0], 400)
+
+    def test_chase_enable_200(self):
+        ctrl = self.make_controller()
+        handler = self.make_handler(path='/api/chase', headers=self.auth_headers())
+        handler.app.ctrl = ctrl
+        self.post_json(handler, {'enabled': True})
+        status, body = handler._responses[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(body['success'])
+        self.assertTrue(ctrl.chase_enabled)
+
+    def test_chase_disable_200(self):
+        ctrl = self.make_controller()
+        ctrl.set_chase(True)
+        handler = self.make_handler(path='/api/chase', headers=self.auth_headers())
+        handler.app.ctrl = ctrl
+        self.post_json(handler, {'enabled': False})
+        self.assertEqual(handler._responses[-1][0], 200)
+        self.assertFalse(ctrl.chase_enabled)
+
+    def test_speed_blink_200_and_persisted(self):
+        cfg_path = os.path.join(self.dir, 'device_config.json')
+        with patch('http_handler.CONFIG_FILE', cfg_path):
+            ctrl = self.make_controller()
+            handler = self.make_handler(path='/api/speed-blink', headers=self.auth_headers())
+            handler.app.ctrl = ctrl
+            handler.app.cfg = {'activity_blink': True}
+            self.post_json(handler, {'enabled': True})
+            status, body = handler._responses[-1]
+            self.assertEqual(status, 200)
+            self.assertTrue(body['success'])
+            self.assertTrue(ctrl.speed_blink_enabled)
+            with open(cfg_path, encoding='utf-8') as f:
+                saved = json.load(f)
+            # additive: the new key lands next to pre-existing ones
+            self.assertTrue(saved['speed_blink'])
+            self.assertTrue(saved['activity_blink'])
+
+    def test_all_off_stops_chase(self):
+        # F2: "全部关闭" must stop the chase or the demo would re-light LEDs
+        ctrl = self.make_controller()
+        ctrl.set_chase(True)
+        self.assertTrue(ctrl.chase_enabled)
+        ok, msg = ctrl.all_off()
+        self.assertTrue(ok)
+        self.assertEqual(msg, 'OK')
+        self.assertFalse(ctrl.chase_enabled)
+        self.assertEqual(ctrl._chase_leds, [])
+        ctrl.run.assert_any_call('all', '-off')
+
+    def test_identify_blinks_led_with_current_color(self):
+        ctrl = self.make_controller()
+        ctrl.set_color('disk1', 10, 20, 30)
+        ctrl.run.reset_mock()
+        ok, err = ctrl.identify('disk1')
+        self.assertTrue(ok)
+        self.assertEqual(err, 'OK')
+        args = ctrl.run.call_args[0]
+        self.assertEqual(args[0], 'disk1')
+        self.assertIn('-blink', args)
+        self.assertIn('400', args)
+        self.assertIn('10', args)
+        self.assertIn('20', args)
+        self.assertIn('30', args)
+
+    def test_identify_records_apply_key(self):
+        ctrl = self.make_controller()
+        ok, _ = ctrl.identify('disk1')
+        self.assertTrue(ok)
+        self.assertEqual(
+            ctrl._last_applied['disk1'],
+            ctrl._apply_key('disk1', 'on', False, effect='manual-blink'))
+
+    def test_identify_invalid_led_fails(self):
+        ctrl = self.make_controller()
+        ok, err = ctrl.identify('disk9')
+        self.assertFalse(ok)
+        self.assertIn('disk9', err)
 
 
 if __name__ == '__main__':

@@ -2,7 +2,7 @@
   'use strict';
 
   const LABELS = ['关闭', '常亮', '自动'];
-  // 效果选项：breath/blink/chase 为扩展效果，后端 Wave 5 对接 /api/control 的 action 校验后生效
+  // 效果选项：off/on/auto 走 /api/control 三态；breath/blink 走 /api/effect；chase 走 /api/chase（演示模式）
   const EFFECT_LABELS = { off: '关闭', on: '常亮', breath: '呼吸', blink: '闪烁', chase: '跑马灯', auto: '自动' };
   let csrf = '';
   let modes = {};
@@ -114,7 +114,19 @@
     const ab = document.getElementById('activity-blink');
     if (ab && data.activity_blink !== undefined) ab.checked = !!data.activity_blink;
     const sb = document.getElementById('speed-blink');
-    if (sb && data.activity_blink !== undefined) sb.checked = !!data.activity_blink;
+    if (sb && data.speed_blink !== undefined) sb.checked = !!data.speed_blink;
+    // E15: 效果显示同步同样跳过本地操作保护窗内的盘位，避免下拉框被旧帧回跳
+    if (data.effects) {
+      const now = Date.now();
+      for (const led in data.effects) {
+        if (src === 'sse' && now - (lastLocalTouch[led] || 0) < 1000) continue;
+        const sel = document.getElementById('effect-' + led);
+        if (sel && EFFECT_LABELS[data.effects[led]]) {
+          sel.value = data.effects[led];
+          sel.dataset.prev = data.effects[led];
+        }
+      }
+    }
 
     if (data.presence) {
       for (const led in data.presence) {
@@ -216,18 +228,28 @@
       sel.dataset.prev = sel.value;
       sel.onchange = () => {
         const val = sel.value;
-        // 跑马灯为演示模式，需确认开启
-        if (val === 'chase' && !confirm('跑马灯为演示模式，将循环闪烁所有磁盘灯，继续？')) {
-          sel.value = sel.dataset.prev;
-          return;
+        const led = sel.dataset.led;
+        let req;
+        if (val === 'chase') {
+          // 跑马灯为演示模式，需确认开启
+          if (!confirm('跑马灯为演示模式，将循环闪烁所有磁盘灯，继续？')) {
+            sel.value = sel.dataset.prev;
+            return;
+          }
+          req = api('POST', '/api/chase', { enabled: true });
+        } else if (val === 'breath' || val === 'blink') {
+          // 闪烁为手动闪烁效果，经 /api/effect 映射为 manual-blink
+          req = api('POST', '/api/effect', { led, effect: val === 'blink' ? 'manual-blink' : 'breath' });
+        } else {
+          // off/on/auto 保持三态，经 /api/control
+          req = api('POST', '/api/control', { led, action: val });
         }
-        // TODO(Wave 5): 后端实现 breath/blink/chase 效果；当前经 /api/control 传递 action
-        api('POST', '/api/control', { led: sel.dataset.led, action: val }).then((r) => {
+        req.then((r) => {
           if (r.success) {
             sel.dataset.prev = val;
-            updateUI(sel.dataset.led, val);
-            lastLocalTouch[sel.dataset.led] = Date.now();
-            toast(sel.dataset.led + ' → ' + (EFFECT_LABELS[val] || val));
+            updateUI(led, val);
+            lastLocalTouch[led] = Date.now();
+            toast(led + ' → ' + (EFFECT_LABELS[val] || val));
           } else {
             sel.value = sel.dataset.prev;
             toast(r.message || '设置失败', 'err');
@@ -276,14 +298,9 @@
       });
     }
 
-    // 速度感知：Todo 22 新增；当前对接 /api/activity-blink，Wave 5 若拆分为独立 IO 速率感知 API 再切换
     const sb = document.getElementById('speed-blink');
     if (sb) {
-      sb.onchange = () => api('POST', '/api/activity-blink', { enabled: sb.checked }).then((r) => {
-        if (r.success) {
-          const ab = document.getElementById('activity-blink');
-          if (ab) ab.checked = sb.checked;
-        }
+      sb.onchange = () => api('POST', '/api/speed-blink', { enabled: sb.checked }).then((r) => {
         toast(r.success ? (sb.checked ? '速度感知已开启' : '速度感知已关闭') : r.message, r.success ? 'ok' : 'err');
       });
     }

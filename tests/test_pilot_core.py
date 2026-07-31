@@ -28,6 +28,37 @@ from uevent_watcher import UeventWatcher
 import app_context as app_context_mod
 
 
+class _PilotTestCase(unittest.TestCase):
+    """Per-test temp files + settings-timer cleanup.
+
+    Every controller gets its own state/settings file in a fresh temp dir,
+    and pending 0.8s save timers are cancelled on teardown — no shared
+    /tmp files leak state between tests (F2/F4).
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._state_file = os.path.join(self._tmp.name, 'state.json')
+        self._settings_file = os.path.join(self._tmp.name, 'settings.json')
+        self._ctrls = []
+
+    def tearDown(self):
+        for ctrl in self._ctrls:
+            if ctrl._settings_timer:
+                ctrl._settings_timer.cancel()
+        self._tmp.cleanup()
+
+    def _make_ctrl(self, disk_count=2, **kwargs):
+        run = MagicMock(return_value=(True, '', ''))
+        ctrl = PilotController(
+            ['power', 'netdev', 'disk1', 'disk2'],
+            run, self._state_file, self._settings_file,
+            disk_count=disk_count, **kwargs,
+        )
+        self._ctrls.append(ctrl)
+        return ctrl
+
+
 class TestDXP4800PlusMapping(unittest.TestCase):
     def test_hctl_mapping(self):
         devices = {
@@ -58,15 +89,7 @@ class TestHotplugSignature(unittest.TestCase):
         self.assertIsInstance(quick_hardware_signature(), tuple)
 
 
-class TestModeAwareHotplug(unittest.TestCase):
-    def _make_ctrl(self):
-        run = MagicMock(return_value=(True, '', ''))
-        return PilotController(
-            ['power', 'netdev', 'disk1', 'disk2'],
-            run, '/tmp/test_state.json', '/tmp/test_settings.json',
-            disk_count=2,
-        )
-
+class TestModeAwareHotplug(_PilotTestCase):
     def test_no_hotplug_when_all_on(self):
         ctrl = self._make_ctrl()
         ctrl.modes = {'power': 'on', 'netdev': 'on', 'disk1': 'on', 'disk2': 'on'}
@@ -91,12 +114,13 @@ class TestModeAwareHotplug(unittest.TestCase):
         self.assertEqual(ctrl._monitor_tier(), 'activity')
 
 
-class TestCliDedup(unittest.TestCase):
+class TestCliDedup(_PilotTestCase):
     def test_apply_skips_duplicate_cli(self):
         run = MagicMock(return_value=(True, '', ''))
         ctrl = PilotController(
-            ['power'], run, '/tmp/t_state.json', '/tmp/t_settings.json', disk_count=0,
+            ['power'], run, self._state_file, self._settings_file, disk_count=0,
         )
+        self._ctrls.append(ctrl)
         ctrl.modes['power'] = 'on'
         ok1, _ = ctrl._apply('power', 'on', False)
         ok2, _ = ctrl._apply('power', 'on', False)
@@ -104,16 +128,8 @@ class TestCliDedup(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
 
 
-class TestAllOff(unittest.TestCase):
+class TestAllOff(_PilotTestCase):
     """Batch all-off via single CLI call with full bookkeeping (E12)."""
-
-    def _make_ctrl(self):
-        run = MagicMock(return_value=(True, '', ''))
-        return PilotController(
-            ['power', 'netdev', 'disk1', 'disk2'],
-            run, '/tmp/test_state.json', '/tmp/test_settings.json',
-            disk_count=2,
-        )
 
     def test_all_off_single_cli_call_and_modes(self):
         ctrl = self._make_ctrl()
@@ -149,15 +165,7 @@ class TestAllOff(unittest.TestCase):
         self.assertEqual(ctrl.modes['power'], 'on')
 
 
-class TestSetColorOffSemantics(unittest.TestCase):
-    def _make_ctrl(self):
-        run = MagicMock(return_value=(True, '', ''))
-        return PilotController(
-            ['power', 'netdev', 'disk1', 'disk2'],
-            run, '/tmp/test_state.json', '/tmp/test_settings.json',
-            disk_count=2,
-        )
-
+class TestSetColorOffSemantics(_PilotTestCase):
     def test_set_color_off_persists_without_cli(self):
         ctrl = self._make_ctrl()
         ctrl.modes['power'] = 'off'
@@ -182,16 +190,8 @@ class TestSetColorOffSemantics(unittest.TestCase):
             'power', '-on', '-color', '0', '255', '0', '-brightness', '255')
 
 
-class TestBreathEffect(unittest.TestCase):
+class TestBreathEffect(_PilotTestCase):
     """F7a (Todo 16): hardware-native breath mode with color/brightness."""
-
-    def _make_ctrl(self):
-        run = MagicMock(return_value=(True, '', ''))
-        return PilotController(
-            ['power', 'netdev', 'disk1', 'disk2'],
-            run, '/tmp/test_state.json', '/tmp/test_settings.json',
-            disk_count=2,
-        )
 
     def test_breath_blue_applies_full_cli(self):
         ctrl = self._make_ctrl()
@@ -283,16 +283,8 @@ class TestBreathEffect(unittest.TestCase):
         self.assertIn('Invalid effect', msg)
 
 
-class TestManualBlinkEffect(unittest.TestCase):
+class TestManualBlinkEffect(_PilotTestCase):
     """F7b (Todo 17): manual blink as a standalone effect (400/400 ms)."""
-
-    def _make_ctrl(self):
-        run = MagicMock(return_value=(True, '', ''))
-        return PilotController(
-            ['power', 'netdev', 'disk1', 'disk2'],
-            run, '/tmp/test_state.json', '/tmp/test_settings.json',
-            disk_count=2,
-        )
 
     def test_manual_blink_cli_full_args(self):
         ctrl = self._make_ctrl()
@@ -316,16 +308,11 @@ class TestManualBlinkEffect(unittest.TestCase):
         ctrl.run.assert_called_once_with('power', '-off')
 
 
-class TestDiskIoCounterReset(unittest.TestCase):
+class TestDiskIoCounterReset(_PilotTestCase):
     """Disk IO counter reset must not be treated as activity (delta=0)."""
 
     def _make_ctrl(self):
-        run = MagicMock(return_value=(True, '', ''))
-        ctrl = PilotController(
-            ['power', 'netdev', 'disk1', 'disk2'],
-            run, '/tmp/test_state.json', '/tmp/test_settings.json',
-            disk_count=2,
-        )
+        ctrl = super()._make_ctrl()
         ctrl._disk_map = {1: 'sda'}
         ctrl.modes['disk1'] = 'auto'
         ctrl.activity['disk1'] = False
@@ -361,16 +348,11 @@ class TestDiskIoCounterReset(unittest.TestCase):
         self.assertNotIn(1, ctrl._prev_disk_io)
 
 
-class TestSpeedAwareBlink(unittest.TestCase):
+class TestSpeedAwareBlink(_PilotTestCase):
     """F7b (Todo 17): rate-tiered blink — steady on / 400ms / 100ms by bytes-per-s."""
 
     def _make_ctrl(self, speed_blink=True):
-        run = MagicMock(return_value=(True, '', ''))
-        return PilotController(
-            ['power', 'netdev', 'disk1', 'disk2'],
-            run, '/tmp/test_state.json', '/tmp/test_settings.json',
-            disk_count=2, speed_blink=speed_blink,
-        )
+        return super()._make_ctrl(speed_blink=speed_blink)
 
     def _seed_net(self, ctrl):
         ctrl.modes['netdev'] = 'auto'
@@ -512,7 +494,7 @@ class _FakeLoopEvents:
         pass
 
 
-class TestChaseEffect(unittest.TestCase):
+class TestChaseEffect(_PilotTestCase):
     """F7c (Todo 18): demo chase (running light) over the disk LEDs.
 
     chase is an independent demo effect: forces the monitor into the
@@ -522,12 +504,7 @@ class TestChaseEffect(unittest.TestCase):
     """
 
     def _make_ctrl(self):
-        run = MagicMock(return_value=(True, '', ''))
-        ctrl = PilotController(
-            ['power', 'netdev', 'disk1', 'disk2'],
-            run, '/tmp/test_state.json', '/tmp/test_settings.json',
-            disk_count=2,
-        )
+        ctrl = super()._make_ctrl()
         ctrl._uevent = MagicMock()
         ctrl._uevent.is_running.return_value = False
         return ctrl
@@ -680,7 +657,7 @@ class TestChaseEffect(unittest.TestCase):
                             for c in ctrl.run.call_args_list))
 
 
-class TestEffectPriorityMatrix(unittest.TestCase):
+class TestEffectPriorityMatrix(_PilotTestCase):
     """F7d (Todo 19): off > on > manual-blink > breath > activity-blink > chase.
 
     User effects (manual-blink/breath) outrank auto activity-blink; a later
@@ -689,28 +666,10 @@ class TestEffectPriorityMatrix(unittest.TestCase):
     paths (set_activity_blink(False), _on_hardware_changed) keep user effects.
     """
 
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self._ctrls = []
-
-    def tearDown(self):
-        for ctrl in self._ctrls:
-            if ctrl._settings_timer:
-                ctrl._settings_timer.cancel()
-        self._tmp.cleanup()
-
     def _make_ctrl(self, disk_count=2):
-        run = MagicMock(return_value=(True, '', ''))
-        ctrl = PilotController(
-            ['power', 'netdev', 'disk1', 'disk2'],
-            run,
-            os.path.join(self._tmp.name, 'state.json'),
-            os.path.join(self._tmp.name, 'settings.json'),
-            disk_count=disk_count,
-        )
+        ctrl = super()._make_ctrl(disk_count=disk_count)
         ctrl._uevent = MagicMock()
         ctrl._uevent.is_running.return_value = False
-        self._ctrls.append(ctrl)
         return ctrl
 
     def test_priority_matrix_ordering(self):
@@ -844,12 +803,14 @@ class TestEffectPriorityMatrix(unittest.TestCase):
             state_file = os.path.join(d, 'led_state.json')
             run = MagicMock(return_value=(True, '', ''))
             ctrl = PilotController(['power'], run, state_file, settings_file, disk_count=0)
+            self._ctrls.append(ctrl)
             ctrl.set_mode('power', 'on')
             ctrl.set_effect('power', 'breath', t_on=500, t_off=800)
             ctrl._flush_settings()
             # simulate restart: rebuild controller from the same files
             run2 = MagicMock(return_value=(True, '', ''))
             ctrl2 = PilotController(['power'], run2, state_file, settings_file, disk_count=0)
+            self._ctrls.append(ctrl2)
             with patch('pilot_core.detect_disks', return_value={}), \
                     patch('pilot_core.detect_net_iface', return_value=None), \
                     patch('pilot_core.list_net_ifaces', return_value=[]):
@@ -881,6 +842,7 @@ class TestEffectPriorityMatrix(unittest.TestCase):
             ctrl = PilotController(
                 ['power'], MagicMock(return_value=(True, '', '')),
                 os.path.join(d, 'led_state.json'), settings_file, disk_count=0)
+            self._ctrls.append(ctrl)
             ctrl.set_effect('power', 'manual-blink')
             ctrl._flush_settings()
             with open(settings_file) as f:
@@ -889,16 +851,8 @@ class TestEffectPriorityMatrix(unittest.TestCase):
             self.assertEqual(saved['effects'], {'power': 'manual-blink'})
 
 
-class TestMultiNicMonitoring(unittest.TestCase):
+class TestMultiNicMonitoring(_PilotTestCase):
     """E13/F2: aggregate rx/tx across all NICs (DXP4800 Plus dual 2.5G)."""
-
-    def _make_ctrl(self):
-        run = MagicMock(return_value=(True, '', ''))
-        return PilotController(
-            ['power', 'netdev', 'disk1', 'disk2'],
-            run, '/tmp/test_state.json', '/tmp/test_settings.json',
-            disk_count=2,
-        )
 
     def test_any_nic_traffic_triggers_active(self):
         ctrl = self._make_ctrl()
