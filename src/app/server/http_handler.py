@@ -222,7 +222,11 @@ class PilotHandler(BaseHTTPRequestHandler):
         led = data.get('led', '')
         if not validate_led(led):
             return self._json(400, {'success': False, 'message': '无效 LED'})
-        ok, msg = self.app.ctrl.set_color(led, int(data['r']), int(data['g']), int(data['b']))
+        try:
+            r, g, b = int(data['r']), int(data['g']), int(data['b'])
+        except (TypeError, ValueError, KeyError):
+            return self._json(400, {'success': False, 'message': 'Invalid color'})
+        ok, msg = self.app.ctrl.set_color(led, r, g, b)
         return self._json(200 if ok else 500, {'success': ok, 'message': msg})
 
     def _preset(self, data):
@@ -234,12 +238,16 @@ class PilotHandler(BaseHTTPRequestHandler):
         return self._json(200 if ok else 400, {'success': ok, 'message': msg, 'color': color})
 
     def _brightness(self, data):
+        try:
+            brightness = int(data.get('brightness', 255))
+        except (TypeError, ValueError):
+            return self._json(400, {'success': False, 'message': 'Invalid brightness'})
         if 'led' in data:
             if not validate_led(data['led']):
                 return self._json(400, {'success': False, 'message': '无效 LED'})
-            ok, msg = self.app.ctrl.set_brightness(data['led'], data.get('brightness', 255))
+            ok, msg = self.app.ctrl.set_brightness(data['led'], brightness)
         else:
-            ok, msg = self.app.ctrl.set_global_brightness(data.get('brightness', 255))
+            ok, msg = self.app.ctrl.set_global_brightness(brightness)
         return self._json(200 if ok else 500, {'success': ok, 'message': msg})
 
     def _all(self, mode):
