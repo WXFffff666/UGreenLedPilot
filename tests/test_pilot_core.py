@@ -1196,6 +1196,8 @@ class TestAppContextAsyncProbe(unittest.TestCase):
                                      side_effect=probe_impl)
         probe_mock = probe_patcher.start()
         self.addCleanup(probe_patcher.stop)
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
         patchers = [
             patch.object(app_context_mod, 'make_cli_runner', return_value=runner),
             patch.object(app_context_mod, 'AuthManager'),
@@ -1206,7 +1208,7 @@ class TestAppContextAsyncProbe(unittest.TestCase):
                          side_effect=lambda path, default: default),
             patch.object(app_context_mod, 'save_json'),
             patch.object(app_context_mod, 'CONFIG_FILE',
-                         os.path.join(tempfile.mkdtemp(), 'no_config.json')),
+                         os.path.join(tmpdir.name, 'no_config.json')),
         ]
         for p in patchers:
             p.start()

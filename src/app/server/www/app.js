@@ -355,7 +355,7 @@
         '<button type="button" class="abtn a cal-bind" data-led="' + led + '">绑定</button>';
       list.appendChild(row);
       row.querySelector('.cal-id').onclick = () => {
-        // TODO(Wave 6, Todo 20): 后端实现 /api/calibrate/identify 点亮对应盘位 LED
+        // 调用 /api/calibrate/identify 点亮盘位 LED
         api('POST', '/api/calibrate/identify', { led }).then((r) => {
           toast(r.success ? '盘位 ' + n + ' LED 已点亮识别' : (r.message || '识别失败'), r.success ? 'ok' : 'err');
         });
@@ -363,7 +363,7 @@
       row.querySelector('.cal-bind').onclick = () => {
         const hctl = row.querySelector('.cal-hctl').value.trim();
         if (!hctl) { toast('请输入 HCTL', 'err'); return; }
-        // TODO(Wave 6, Todo 20): 后端实现 /api/calibrate/bind 写入 slot → hctl 映射
+        // 调用 /api/calibrate/bind 保存绑定
         api('POST', '/api/calibrate/bind', { slot: led, hctl }).then((r) => {
           toast(r.success ? '盘位 ' + n + ' 已绑定 ' + hctl : (r.message || '绑定失败'), r.success ? 'ok' : 'err');
         });

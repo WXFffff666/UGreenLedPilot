@@ -336,13 +336,13 @@ class PilotHandler(BaseHTTPRequestHandler):
 
     def _chase(self, data):
         """F1 (Todo 17): toggle the chase demo (running light)."""
-        enabled = bool(data.get('enabled', True))
+        enabled = data.get('enabled', True) is not False
         ok, msg = self.app.ctrl.set_chase(enabled)
         return self._json(200 if ok else 500, {'success': ok, 'message': msg})
 
     def _speed_blink(self, data):
         """F1 (Todo 17): toggle rate-aware blink, persisted to device_config."""
-        enabled = bool(data.get('enabled', True))
+        enabled = data.get('enabled', True) is not False
         ok, msg = self.app.ctrl.set_speed_blink(enabled)
         self.app.cfg['speed_blink'] = enabled
         save_json(CONFIG_FILE, self.app.cfg)

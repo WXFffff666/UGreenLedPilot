@@ -16,11 +16,15 @@ class UeventWatcher:
         self._thread = None
         self.available = False
         self._running = False
+        self._failed = False
 
     def is_running(self):
         return self._running and self._thread and self._thread.is_alive()
 
     def start(self):
+        if self._failed:
+            # No AF_NETLINK on this platform; latching prevents re-spawn loops.
+            return
         if self.is_running():
             return
         if self._thread and self._thread.is_alive():
@@ -50,8 +54,9 @@ class UeventWatcher:
             self.available = True
             self._running = True
             print('Hotplug: netlink uevent listener active (event-driven, no polling)')
-        except OSError as exc:
+        except (OSError, AttributeError) as exc:
             print(f'Hotplug: netlink unavailable ({exc}), fallback to slow signature poll')
+            self._failed = True
             return
 
         while not self._stop.is_set():
