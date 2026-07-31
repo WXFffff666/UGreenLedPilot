@@ -431,8 +431,7 @@ class PilotController:
                 ok, err = self._apply(led, mode, self.activity.get(led, False))
                 self._notify()
                 return ok, err
-        ok, _, err = self.run(led, '-on', '-color', str(r), str(g), str(b))
-        return ok, err
+            return True, 'OK'
 
     def set_brightness(self, led, brightness):
         with self._lock:

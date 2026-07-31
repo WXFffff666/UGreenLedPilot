@@ -94,6 +94,39 @@ class TestCliDedup(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
 
 
+class TestSetColorOffSemantics(unittest.TestCase):
+    def _make_ctrl(self):
+        run = MagicMock(return_value=(True, '', ''))
+        return PilotController(
+            ['power', 'netdev', 'disk1', 'disk2'],
+            run, '/tmp/test_state.json', '/tmp/test_settings.json',
+            disk_count=2,
+        )
+
+    def test_set_color_off_persists_without_cli(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes['power'] = 'off'
+        before = ctrl.get_status()
+        ok, msg = ctrl.set_color('power', 0, 255, 0)
+        self.assertTrue(ok)
+        self.assertEqual(ctrl.settings['power']['color'], [0, 255, 0])
+        ctrl.run.assert_not_called()
+        after = ctrl.get_status()
+        self.assertEqual(after['modes']['power'], 'off')
+        self.assertEqual(after['activity'], before['activity'])
+        self.assertEqual(after['presence'], before['presence'])
+
+    def test_set_color_off_then_mode_on_applies_new_color(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes['power'] = 'off'
+        ctrl.set_color('power', 0, 255, 0)
+        ctrl.run.reset_mock()
+        ok, msg = ctrl.set_mode('power', 'on')
+        self.assertTrue(ok)
+        ctrl.run.assert_called_once_with(
+            'power', '-on', '-color', '0', '255', '0', '-brightness', '255')
+
+
 class TestBroadcaster(unittest.TestCase):
     def test_publish_notify(self):
         bc = StatusBroadcaster()
