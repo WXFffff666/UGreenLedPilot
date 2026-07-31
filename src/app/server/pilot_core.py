@@ -8,6 +8,7 @@ import threading
 import time
 
 from utils import load_json, save_json
+from uevent_watcher import UeventWatcher
 
 VALID_MODES = ['off', 'on', 'auto']
 MAX_DISK_LEDS = 4
@@ -28,11 +29,12 @@ DXP4800_PLUS_PROFILE = {
 
 BLINK_ON_MS = 80
 BLINK_OFF_MS = 120
-MONITOR_ACTIVE_INTERVAL = 0.4
-MONITOR_IDLE_INTERVAL = 2.0
-HOTPLUG_INTERVAL = 2.0
 ACTIVITY_IO_THRESHOLD = 1
 SETTINGS_SAVE_DELAY = 0.8
+ACTIVITY_FAST_INTERVAL = 0.5
+ACTIVITY_SLOW_INTERVAL = 3.0
+HOTPLUG_FALLBACK_INTERVAL = 120.0
+SLEEP_WAKE_TIMEOUT = 3600.0
 
 WHITE = [255, 255, 255]
 NETDEV_ORANGE = [255, 165, 0]
@@ -65,6 +67,10 @@ def run_cmd(*args):
 
 
 def make_cli_runner(cli_path):
+    """All LED hardware control goes through ugreen_leds_cli only."""
+    if not os.path.isfile(cli_path):
+        print(f'WARNING: ugreen_leds_cli not found at {cli_path}')
+
     def run(*args):
         try:
             r = subprocess.run([cli_path] + list(args), capture_output=True, text=True, timeout=5)
@@ -300,12 +306,8 @@ def disk_present(dev):
     return bool(dev) and os.path.isfile(f'/sys/block/{dev}/stat')
 
 
-def quick_hardware_signature():
-    return (disk_signature(), net_signature())
-
-
 class StatusBroadcaster:
-    """Thread-safe pub/sub for SSE clients."""
+    """Thread-safe pub/sub for SSE clients with blocking wait."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -314,26 +316,28 @@ class StatusBroadcaster:
 
     def subscribe(self):
         q = []
+        ev = threading.Event()
         with self._lock:
-            self._subscribers.append(q)
-        return q
+            self._subscribers.append((q, ev))
+        return q, ev
 
-    def unsubscribe(self, q):
+    def unsubscribe(self, sub):
+        q = sub[0] if isinstance(sub, tuple) else sub
         with self._lock:
-            if q in self._subscribers:
-                self._subscribers.remove(q)
+            self._subscribers = [(sq, se) for sq, se in self._subscribers if sq is not q]
 
     def publish(self, payload):
         with self._lock:
             self._version += 1
             dead = []
-            for q in self._subscribers:
+            for i, (q, ev) in enumerate(self._subscribers):
                 if len(q) > 20:
-                    dead.append(q)
+                    dead.append(i)
                 else:
                     q.append(payload)
-            for q in dead:
-                self._subscribers.remove(q)
+                    ev.set()
+            for i in reversed(dead):
+                self._subscribers.pop(i)
 
     @property
     def version(self):
@@ -341,10 +345,11 @@ class StatusBroadcaster:
 
 
 class PilotController:
-    """LED controller with mode-aware hotplug, CLI dedup, adaptive monitoring."""
+    """LED controller — ugreen_leds_cli only, tiered zero-poll monitoring."""
 
     def __init__(self, led_names, run, state_file, settings_file,
-                 ata_map=None, hctl_map=None, disk_count=4, broadcaster=None):
+                 ata_map=None, hctl_map=None, disk_count=4, broadcaster=None,
+                 activity_blink=True):
         self.leds = led_names
         self.run = run
         self.state_file = state_file
@@ -353,6 +358,7 @@ class PilotController:
         self.hctl_map = hctl_map or DXP4800_PLUS_PROFILE['hctl_map']
         self.disk_count = min(disk_count, MAX_DISK_LEDS)
         self.broadcaster = broadcaster or StatusBroadcaster()
+        self.activity_blink_enabled = bool(activity_blink)
         self.modes = {}
         self.activity = {}
         self.presence = {}
@@ -367,11 +373,15 @@ class PilotController:
         self._last_applied = {}
         self._lock = threading.RLock()
         self._stop = threading.Event()
+        self._wake_event = threading.Event()
+        self._hotplug_pending = threading.Event()
         self._thread = None
         self._rescan_count = 0
         self._settings_dirty = False
         self._settings_timer = None
         self._last_hotplug_check = 0.0
+        self._activity_idle_rounds = 0
+        self._uevent = UeventWatcher(self._on_uevent_hotplug)
 
     def _load_settings(self):
         saved = load_json(self.settings_file, {})
@@ -466,12 +476,52 @@ class PilotController:
         return self._needs_disk_hotplug() or self._needs_net_hotplug()
 
     def _has_auto_activity_targets(self):
+        if not self.activity_blink_enabled:
+            return False
         if self.modes.get('netdev') == 'auto':
             return True
         for slot in range(1, self.disk_count + 1):
             if self.modes.get(f'disk{slot}') == 'auto':
                 return True
         return False
+
+    def _monitor_tier(self):
+        if not self.needs_hotplug_monitor():
+            return 'sleep'
+        if not self.activity_blink_enabled:
+            return 'hotplug'
+        return 'activity'
+
+    def _wake_monitor(self):
+        self._wake_event.set()
+
+    def _on_uevent_hotplug(self):
+        if not self.needs_hotplug_monitor():
+            return
+        self._hotplug_pending.set()
+        self._wake_monitor()
+
+    def _sync_watchers(self):
+        tier = self._monitor_tier()
+        if tier in ('hotplug', 'activity'):
+            if not self._uevent.is_running():
+                self._uevent.start()
+        else:
+            self._uevent.stop()
+
+    def set_activity_blink(self, enabled):
+        with self._lock:
+            self.activity_blink_enabled = bool(enabled)
+            if not enabled:
+                for led in self.leds:
+                    if self.activity.get(led):
+                        self.activity[led] = False
+                        if self.modes.get(led) == 'auto':
+                            self._apply(led, 'auto', activity=False)
+            self._sync_watchers()
+            self._wake_monitor()
+            self._notify()
+            return True, 'OK'
 
     def _is_present(self, led):
         if led == 'power':
@@ -531,6 +581,8 @@ class PilotController:
             self.modes[led] = mode
             self.activity[led] = False
             self._persist()
+            self._sync_watchers()
+            self._wake_monitor()
             self._notify()
             return True, 'OK'
 
@@ -577,7 +629,8 @@ class PilotController:
             self._refresh_signatures()
             self._update_presence()
         print(f'DXP4800 Plus — Disks: {self._disk_map}, Network: {self._net_iface or "none"}')
-        print(f'Hotplug monitor: {"enabled" if self.needs_hotplug_monitor() else "disabled"}')
+        tier = self._monitor_tier()
+        print(f'Monitor tier: {tier} (hotplug={"on" if self.needs_hotplug_monitor() else "off"})')
 
         if self._net_iface:
             base = f'/sys/class/net/{self._net_iface}/statistics'
@@ -587,11 +640,14 @@ class PilotController:
             if disk_present(dev):
                 self._prev_disk_io[slot] = read_disk_io(f'/sys/block/{dev}/stat')
 
+        self._sync_watchers()
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True, name='pilot-monitor')
         self._thread.start()
 
     def stop_monitor(self):
         self._stop.set()
+        self._wake_monitor()
+        self._uevent.stop()
         if self._settings_timer:
             self._settings_timer.cancel()
         self._flush_settings()
@@ -643,34 +699,51 @@ class PilotController:
             return True
         return False
 
-    def _monitor_interval(self):
-        return MONITOR_ACTIVE_INTERVAL if self._has_auto_activity_targets() else MONITOR_IDLE_INTERVAL
-
     def _monitor_loop(self):
         while not self._stop.is_set():
-            interval = self._monitor_interval()
+            tier = self._monitor_tier()
+            self._sync_watchers()
+
+            if tier == 'sleep':
+                self._wake_event.wait(timeout=SLEEP_WAKE_TIMEOUT)
+                self._wake_event.clear()
+                continue
+
+            interval = ACTIVITY_FAST_INTERVAL
             notified = False
             try:
-                now = time.monotonic()
-                do_hotplug = (
-                    self.needs_hotplug_monitor()
-                    and (now - self._last_hotplug_check) >= HOTPLUG_INTERVAL
-                )
-                if do_hotplug:
-                    self._last_hotplug_check = now
+                if self._hotplug_pending.is_set():
+                    self._hotplug_pending.clear()
+                    with self._lock:
+                        self._on_hardware_changed()
+                    notified = True
+                elif tier == 'hotplug':
+                    now = time.monotonic()
+                    if (now - self._last_hotplug_check) >= HOTPLUG_FALLBACK_INTERVAL:
+                        self._last_hotplug_check = now
+                        with self._lock:
+                            if self._maybe_rescan():
+                                notified = True
+                else:
+                    with self._lock:
+                        if self._check_network() or self._check_disks():
+                            notified = True
+                            self._activity_idle_rounds = 0
+                            interval = ACTIVITY_FAST_INTERVAL
+                        else:
+                            self._activity_idle_rounds += 1
+                            if self._activity_idle_rounds > 20:
+                                interval = ACTIVITY_SLOW_INTERVAL
+                            elif self._activity_idle_rounds > 6:
+                                interval = 1.5
 
-                with self._lock:
-                    if do_hotplug and self._maybe_rescan():
-                        notified = True
-                    if self._check_network():
-                        notified = True
-                    if self._check_disks():
-                        notified = True
                 if notified:
                     self._notify()
             except Exception as e:
                 print(f'Monitor error: {e}')
-            self._stop.wait(interval)
+
+            if self._wake_event.wait(timeout=interval):
+                self._wake_event.clear()
 
     def _check_network(self):
         led = 'netdev'
@@ -729,6 +802,9 @@ class PilotController:
                 'presence': dict(self.presence),
                 'net_iface': self._net_iface,
                 'hotplug_monitor': self.needs_hotplug_monitor(),
+                'monitor_tier': self._monitor_tier(),
+                'activity_blink': self.activity_blink_enabled,
+                'uevent_available': self._uevent.available,
                 'rescan_count': self._rescan_count,
             }
 
@@ -744,6 +820,9 @@ class PilotController:
                 'leds': self.leds,
                 'presets': COLOR_PRESETS,
                 'hotplug_monitor': self.needs_hotplug_monitor(),
+                'monitor_tier': self._monitor_tier(),
+                'activity_blink': self.activity_blink_enabled,
+                'uevent_available': self._uevent.available,
                 'rescan_count': self._rescan_count,
                 'model': DXP4800_PLUS_PROFILE,
             }

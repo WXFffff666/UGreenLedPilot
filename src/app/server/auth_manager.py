@@ -147,6 +147,8 @@ class AuthManager:
             return False, '旧密码错误'
         if not new_password or len(new_password) < 8:
             return False, '新密码至少8位'
+        if len(new_password) > 128:
+            return False, '新密码不能超过128位'
         if new_password == 'admin123':
             return False, '请勿使用默认密码'
         self.set_password(new_password)

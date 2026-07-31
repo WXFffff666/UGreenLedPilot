@@ -1,12 +1,24 @@
-appname               = UGreenLedPilot
-version               = 2.0.0
-display_name          = UGreen LED Pilot
-desc                  = 绿联 DXP4800 Plus 专用 LED 控制 v2。模块化架构、SSE 实时推送、CLI 去重、自适应监控、独立前端 UI。
-arch                  = x86_64
-source                = thirdparty
-maintainer            = WXFffff666
-distributor           = WXFffff666
-desktop_uidir         = ui
-desktop_applaunchname = UGreenLedPilot.Application
-service_port          = 19580
-changelog             = v2.0.0: 大重构。ThreadingHTTPServer+SSE 替代轮询；CLI 状态去重；自适应监控间隔；独立 www 前端。
+appname               = UGreenLedPilot
+
+version               = 2.1.0
+
+display_name          = UGreen LED Pilot
+
+desc                  = 绿联 DXP4800 Plus 专用 LED 控制 v2.1。uevent 事件驱动热插拔、分层零开销监控、玻璃拟态 UI、ugreen_leds_cli 独占驱动。
+
+arch                  = x86_64
+
+source                = thirdparty
+
+maintainer            = WXFffff666
+
+distributor           = WXFffff666
+
+desktop_uidir         = ui
+
+desktop_applaunchname = UGreenLedPilot.Application
+
+service_port          = 19580
+
+changelog             = v2.1.0: netlink uevent 热插拔零轮询；常亮/关闭监控休眠；活动闪烁可关；SSE 阻塞推送；玻璃拟态 UI；安全加固。
+

@@ -4,7 +4,6 @@ import json
 import mimetypes
 import os
 import re
-import time
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import unquote
 
@@ -14,9 +13,6 @@ from utils import remove_file, save_json
 
 MAX_BODY_BYTES = 65536
 LED_NAME_RE = re.compile(r'^(power|netdev|disk[1-4])$')
-STATE_FILE = None
-SETTINGS_FILE = None
-CONFIG_FILE = None
 
 
 def validate_led(led):
@@ -38,6 +34,7 @@ class PilotHandler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('X-Frame-Options', 'SAMEORIGIN')
         self.send_header('Referrer-Policy', 'strict-origin-when-cross-origin')
+        self.send_header('X-Robots-Tag', 'noindex, nofollow')
         self.send_header('Cache-Control', 'no-store')
         self.send_header(
             'Content-Security-Policy',
@@ -120,6 +117,7 @@ class PilotHandler(BaseHTTPRequestHandler):
             '/api/save': lambda: (self.app.ctrl._persist(), self._json(200, {'success': True}))[1],
             '/api/change-password': lambda: self._change_password(data),
             '/api/remap': self._remap,
+            '/api/activity-blink': lambda: self._activity_blink(data),
             '/api/all/off': lambda: self._all('off'),
             '/api/all/on': lambda: self._all('on'),
             '/api/all/auto': lambda: self._all('auto'),
@@ -153,7 +151,7 @@ class PilotHandler(BaseHTTPRequestHandler):
         self._send_security_headers()
         self.end_headers()
 
-        queue = self.app.broadcaster.subscribe()
+        queue, ev = self.app.broadcaster.subscribe()
         try:
             payload = json.dumps(self.app.ctrl.get_live_status(), ensure_ascii=False)
             self.wfile.write(f'data: {payload}\n\n'.encode())
@@ -164,14 +162,18 @@ class PilotHandler(BaseHTTPRequestHandler):
                     payload = json.dumps(queue.pop(0), ensure_ascii=False)
                     self.wfile.write(f'data: {payload}\n\n'.encode())
                     self.wfile.flush()
-                else:
-                    self.wfile.write(b': keepalive\n\n')
-                    self.wfile.flush()
-                time.sleep(0.5)
+                    continue
+                ev.clear()
+                if not ev.wait(timeout=30.0):
+                    try:
+                        self.wfile.write(b': keepalive\n\n')
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
-            self.app.broadcaster.unsubscribe(queue)
+            self.app.broadcaster.unsubscribe((queue, ev))
 
     def _login(self, data):
         ip = self._client_ip()
@@ -249,6 +251,15 @@ class PilotHandler(BaseHTTPRequestHandler):
             if not ok:
                 errors.append(f'{led}: {msg}')
         return self._json(500 if errors else 200, {'success': not errors, 'message': '; '.join(errors)})
+
+    def _activity_blink(self, data):
+        enabled = bool(data.get('enabled', True))
+        ok, msg = self.app.ctrl.set_activity_blink(enabled)
+        self.app.cfg['activity_blink'] = enabled
+        from utils import save_json
+        from app_context import CONFIG_FILE
+        save_json(CONFIG_FILE, self.app.cfg)
+        return self._json(200 if ok else 500, {'success': ok, 'message': msg})
 
     def _remap(self):
         ok, msg = self.app.ctrl.force_remap()

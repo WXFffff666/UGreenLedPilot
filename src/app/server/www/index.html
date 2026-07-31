@@ -25,10 +25,16 @@
     <main class="panel">
       <div class="panel-hd">
         <h2>指示灯控制</h2>
-        <label class="global-bright">
-          <span>全局亮度</span>
-          <input type="range" id="global-brightness" min="0" max="255" value="255">
-        </label>
+        <div class="panel-tools">
+          <label class="toggle-row" title="关闭后自动模式仅检测拔插，不轮询 IO，CPU 更低">
+            <input type="checkbox" id="activity-blink" checked>
+            <span>活动闪烁</span>
+          </label>
+          <label class="global-bright">
+            <span>全局亮度</span>
+            <input type="range" id="global-brightness" min="0" max="255" value="255">
+          </label>
+        </div>
       </div>
 
       <div class="legend">
@@ -36,7 +42,7 @@
         <span class="leg"><i class="dot on"></i>常亮</span>
         <span class="leg"><i class="dot auto"></i>自动</span>
       </div>
-      <p class="hint">常亮/关闭不扫描热插拔；仅自动模式在硬件变化时重映射。</p>
+      <p class="hint">常亮/关闭时监控线程休眠零开销；自动模式通过内核 uevent 仅在拔插时重扫；关闭活动闪烁可进一步降低 CPU。</p>
 
       <section class="sys-grid" id="sys-grid">
         <article class="sys-card sitem" data-led="power">

@@ -4,7 +4,7 @@
 BUNDLED_CLI="${TRIM_APPDEST}/server/ugreen_leds_cli"
 SYSTEM_CLI="/usr/local/bin/ugreen_leds_cli"
 
-echo "=== FnUGreenLed Install Init ==="
+echo "=== UGreenLedPilot Install Init ==="
 
 # --- 1. Load i2c-dev kernel module ---
 echo "[1/5] Loading i2c-dev kernel module..."

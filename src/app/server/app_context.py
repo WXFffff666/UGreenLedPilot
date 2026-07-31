@@ -10,7 +10,7 @@ from pilot_core import (
 )
 from utils import load_json, save_json
 
-APP_VERSION = '2.0.0'
+APP_VERSION = '2.1.0'
 
 _BUNDLED = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ugreen_leds_cli')
 CLI = _BUNDLED if os.path.exists(_BUNDLED) else '/usr/local/bin/ugreen_leds_cli'
@@ -49,6 +49,7 @@ class AppContext:
             hctl_map=self.cfg.get('hctl_map', DXP4800_PLUS_PROFILE['hctl_map']),
             disk_count=self.disk_count,
             broadcaster=self.broadcaster,
+            activity_blink=self.cfg.get('activity_blink', True),
         )
         self.ctrl.restore_state(hardware_modes=self.hardware_modes, apply_hardware=True)
         self.ctrl.start_monitor()
@@ -62,6 +63,7 @@ class AppContext:
             'auto_detected': True,
             'ata_map': DXP4800_PLUS_PROFILE['ata_map'],
             'hctl_map': DXP4800_PLUS_PROFILE['hctl_map'],
+            'activity_blink': True,
         }
 
     def reset_controller(self):
@@ -74,6 +76,7 @@ class AppContext:
             self.led_names, self.run, STATE_FILE, SETTINGS_FILE,
             ata_map=self.cfg['ata_map'], hctl_map=self.cfg['hctl_map'],
             disk_count=self.disk_count, broadcaster=self.broadcaster,
+            activity_blink=self.cfg.get('activity_blink', True),
         )
         self.ctrl.restore_state(apply_hardware=True)
         self.ctrl.start_monitor()

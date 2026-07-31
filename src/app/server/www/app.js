@@ -79,8 +79,14 @@
     }
     const monChip = document.getElementById('monitor-chip');
     if (monChip) {
-      monChip.textContent = '热插拔: ' + (data.hotplug_monitor ? '监听中' : '已跳过');
+      const tier = data.monitor_tier || (data.hotplug_monitor ? 'active' : 'sleep');
+      const labels = { sleep: '休眠', hotplug: '事件驱动', activity: '活动监测' };
+      monChip.textContent = '监控: ' + (labels[tier] || tier);
+      monChip.classList.toggle('on', tier !== 'sleep');
     }
+
+    const ab = document.getElementById('activity-blink');
+    if (ab && data.activity_blink !== undefined) ab.checked = !!data.activity_blink;
 
     if (data.presence) {
       for (const led in data.presence) {
@@ -196,6 +202,13 @@
           document.querySelectorAll('.brit').forEach((s) => { s.value = gb.value; });
           toast('全局亮度已更新');
         }
+      });
+    }
+
+    const ab = document.getElementById('activity-blink');
+    if (ab) {
+      ab.onchange = () => api('POST', '/api/activity-blink', { enabled: ab.checked }).then((r) => {
+        toast(r.success ? (ab.checked ? '活动闪烁已开启' : '活动闪烁已关闭，仅事件驱动') : r.message, r.success ? 'ok' : 'err');
       });
     }
 

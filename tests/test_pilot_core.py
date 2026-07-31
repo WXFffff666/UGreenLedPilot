@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for UGreenLedPilot v2."""
+"""Unit tests for UGreenLedPilot v2.1."""
 
 import os
 import sys
@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src' / 'app' / 'server'))
 
 from pilot_core import (
-    map_disks_by_profile, disk_present, disk_signature, net_signature,
+    map_disks_by_profile, disk_signature, net_signature,
     quick_hardware_signature, DEFAULT_SETTINGS, NETDEV_ORANGE, WHITE,
     DXP4800_PLUS_PROFILE, PilotController, StatusBroadcaster,
 )
@@ -61,11 +61,24 @@ class TestModeAwareHotplug(unittest.TestCase):
         ctrl = self._make_ctrl()
         ctrl.modes = {'power': 'on', 'netdev': 'on', 'disk1': 'on', 'disk2': 'on'}
         self.assertFalse(ctrl.needs_hotplug_monitor())
+        self.assertEqual(ctrl._monitor_tier(), 'sleep')
 
     def test_hotplug_when_any_auto(self):
         ctrl = self._make_ctrl()
         ctrl.modes = {'power': 'on', 'netdev': 'off', 'disk1': 'auto', 'disk2': 'off'}
         self.assertTrue(ctrl.needs_hotplug_monitor())
+
+    def test_hotplug_tier_without_activity_blink(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes = {'power': 'off', 'netdev': 'auto', 'disk1': 'off', 'disk2': 'off'}
+        ctrl.activity_blink_enabled = False
+        self.assertEqual(ctrl._monitor_tier(), 'hotplug')
+
+    def test_activity_tier_with_blink(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes = {'power': 'off', 'netdev': 'auto', 'disk1': 'off', 'disk2': 'off'}
+        ctrl.activity_blink_enabled = True
+        self.assertEqual(ctrl._monitor_tier(), 'activity')
 
 
 class TestCliDedup(unittest.TestCase):
@@ -84,9 +97,10 @@ class TestCliDedup(unittest.TestCase):
 class TestBroadcaster(unittest.TestCase):
     def test_publish_notify(self):
         bc = StatusBroadcaster()
-        q = bc.subscribe()
+        q, ev = bc.subscribe()
         bc.publish({'modes': {'power': 'on'}})
         self.assertEqual(len(q), 1)
+        self.assertTrue(ev.is_set())
 
 
 class TestAuthSecurity(unittest.TestCase):
@@ -101,6 +115,11 @@ class TestAuthSecurity(unittest.TestCase):
     def test_csrf_on_session(self):
         _, csrf = self.auth.create_session()
         self.assertTrue(self.auth.validate_csrf(csrf))
+
+    def test_password_max_length(self):
+        ok, msg = self.auth.change_password('admin123', 'a' * 129)
+        self.assertFalse(ok)
+        self.assertIn('128', msg)
 
 
 if __name__ == '__main__':
