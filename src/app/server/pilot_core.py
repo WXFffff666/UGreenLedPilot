@@ -585,6 +585,21 @@ class PilotController:
             self._notify()
             return True, 'OK'
 
+    def all_off(self):
+        with self._lock:
+            ok, _, err = self.run('all', '-off')
+            if not ok:
+                return False, err or 'OK'
+            for led in self.leds:
+                self.modes[led] = 'off'
+                self.activity[led] = False
+                self._last_applied[led] = self._apply_key(led, 'off', False)
+            self._persist()
+            self._sync_watchers()
+            self._wake_monitor()
+            self._notify()
+            return True, 'OK'
+
     def _apply(self, led, mode, activity=False):
         key = self._apply_key(led, mode, activity)
         if self._last_applied.get(led) == key:

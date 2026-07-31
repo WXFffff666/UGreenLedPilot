@@ -25,6 +25,7 @@ from pilot_core import (
 from auth_manager import AuthManager, PBKDF2_ITERATIONS
 from http_handler import PilotHandler
 from uevent_watcher import UeventWatcher
+import app_context as app_context_mod
 
 
 class TestDXP4800PlusMapping(unittest.TestCase):
@@ -101,6 +102,51 @@ class TestCliDedup(unittest.TestCase):
         ok2, _ = ctrl._apply('power', 'on', False)
         self.assertTrue(ok1 and ok2)
         self.assertEqual(run.call_count, 1)
+
+
+class TestAllOff(unittest.TestCase):
+    """Batch all-off via single CLI call with full bookkeeping (E12)."""
+
+    def _make_ctrl(self):
+        run = MagicMock(return_value=(True, '', ''))
+        return PilotController(
+            ['power', 'netdev', 'disk1', 'disk2'],
+            run, '/tmp/test_state.json', '/tmp/test_settings.json',
+            disk_count=2,
+        )
+
+    def test_all_off_single_cli_call_and_modes(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes = {'power': 'on', 'netdev': 'on', 'disk1': 'on', 'disk2': 'on'}
+        ok, msg = ctrl.all_off()
+        self.assertTrue(ok)
+        self.assertEqual(msg, 'OK')
+        ctrl.run.assert_called_once_with('all', '-off')
+        self.assertEqual(ctrl.get_status()['modes'],
+                         {'power': 'off', 'netdev': 'off', 'disk1': 'off', 'disk2': 'off'})
+
+    def test_all_off_then_single_on_not_deduped(self):
+        ctrl = self._make_ctrl()
+        ctrl.set_color('power', 255, 255, 255)  # deterministic color, ignores stale settings file
+        ok, _ = ctrl.set_mode('power', 'on')  # seeds _last_applied with an ('on', ...) key
+        self.assertTrue(ok)
+        ctrl.run.reset_mock()
+        ok, _ = ctrl.all_off()
+        self.assertTrue(ok)
+        ctrl.run.reset_mock()
+        ok, _ = ctrl.set_mode('power', 'on')  # stale 'on' key must have been replaced
+        self.assertTrue(ok)
+        ctrl.run.assert_called_once_with(
+            'power', '-on', '-color', '255', '255', '255', '-brightness', '255')
+
+    def test_all_off_failure_keeps_modes(self):
+        ctrl = self._make_ctrl()
+        ctrl.run.return_value = (False, '', 'cli boom')
+        ctrl.modes = {'power': 'on', 'netdev': 'on', 'disk1': 'on', 'disk2': 'on'}
+        ok, msg = ctrl.all_off()
+        self.assertFalse(ok)
+        self.assertEqual(msg, 'cli boom')
+        self.assertEqual(ctrl.modes['power'], 'on')
 
 
 class TestSetColorOffSemantics(unittest.TestCase):
@@ -411,6 +457,144 @@ class TestUeventWatcher(unittest.TestCase):
             watcher.stop()  # safe even though the thread already exited
             self.assertIsNone(watcher._thread)
             self.assertFalse(watcher.is_running())
+
+
+class TestAppContextAsyncProbe(unittest.TestCase):
+    """AppContext must not block startup on LED probing, and all CLI
+    (I2C) access must be serialized by a shared lock (probe thread,
+    restore_state and set_mode never interleave on the bus)."""
+
+    def _make(self, probe_result=({}, ''), probe_impl=None):
+        """Build an AppContext with all heavy deps mocked.
+
+        probe_impl replaces probe_leds: either a MagicMock (then
+        probe_result is returned) or a plain function run on the daemon
+        probe thread. Returns (ctx, fake_ctrl, runner, probe_mock).
+        """
+        runner = MagicMock(return_value=(True, '', ''))
+        fake_ctrl = MagicMock()
+        if probe_impl is None:
+            probe_impl = MagicMock(return_value=probe_result)
+        probe_patcher = patch.object(app_context_mod, 'probe_leds',
+                                     side_effect=probe_impl)
+        probe_mock = probe_patcher.start()
+        self.addCleanup(probe_patcher.stop)
+        patchers = [
+            patch.object(app_context_mod, 'make_cli_runner', return_value=runner),
+            patch.object(app_context_mod, 'AuthManager'),
+            patch.object(app_context_mod, 'StatusBroadcaster'),
+            patch.object(app_context_mod, 'detect_model', return_value={}),
+            patch.object(app_context_mod, 'PilotController', return_value=fake_ctrl),
+            patch.object(app_context_mod, 'load_json',
+                         side_effect=lambda path, default: default),
+            patch.object(app_context_mod, 'save_json'),
+            patch.object(app_context_mod, 'CONFIG_FILE',
+                         os.path.join(tempfile.mkdtemp(), 'no_config.json')),
+        ]
+        for p in patchers:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patchers])
+        return app_context_mod.AppContext(), fake_ctrl, runner, probe_mock
+
+    @staticmethod
+    def _wait_probe(ctx, wait=2.0):
+        deadline = time.time() + wait
+        while ctx.probe_pending and time.time() < deadline:
+            time.sleep(0.01)
+        return not ctx.probe_pending
+
+    def test_init_returns_before_slow_probe_finishes(self):
+        release = threading.Event()
+
+        def slow_probe(run):
+            release.wait(5)
+            return {'disk1': {'mode': 'on'}}, ''
+
+        start = time.monotonic()
+        ctx, fake_ctrl, runner, probe_mock = self._make(probe_impl=slow_probe)
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 1.0,
+                        f'__init__ took {elapsed:.2f}s — probe blocked startup')
+        # state stays empty + probe_pending while probing
+        self.assertTrue(ctx.probe_pending)
+        self.assertEqual(ctx.led_statuses, {})
+        self.assertEqual(ctx.hardware_modes, {})
+        self.assertEqual(ctx.detected, 0)
+        self.assertEqual(ctx.probe_error, '')
+        # probe not ready -> restore falls back to saved/auto (empty modes)
+        fake_ctrl.restore_state.assert_called_once_with(
+            hardware_modes={}, apply_hardware=True)
+        release.set()
+        self.assertTrue(self._wait_probe(ctx), 'probe should finish after release')
+        self.assertFalse(ctx.probe_pending)
+        self.assertEqual(ctx.led_statuses['disk1']['mode'], 'on')
+        fake_ctrl.start_monitor.assert_called_once_with()
+
+    def test_probe_results_populate_state(self):
+        statuses = {
+            'power': {'mode': 'auto'}, 'netdev': {'mode': 'auto'},
+            'disk1': {'mode': 'on'}, 'disk2': {'mode': 'off'},
+        }
+        ctx, fake_ctrl, runner, probe_mock = self._make(probe_result=(statuses, ''))
+        self.assertTrue(self._wait_probe(ctx))
+        self.assertFalse(ctx.probe_pending)
+        self.assertEqual(ctx.detected, 2)
+        self.assertEqual(ctx.hardware_modes, {
+            'power': 'auto', 'netdev': 'auto',
+            'disk1': 'on', 'disk2': 'off',
+        })
+        self.assertEqual(ctx.probe_error, '')
+        # probe ran on the background thread with the locked runner
+        self.assertEqual(probe_mock.call_count, 1)
+        self.assertIs(probe_mock.call_args.args[0], ctx.run)
+
+    def test_probe_failure_reported_and_app_continues(self):
+        ctx, fake_ctrl, runner, probe_mock = self._make(
+            probe_result=({}, 'CLI not found'))
+        self.assertTrue(self._wait_probe(ctx))
+        self.assertFalse(ctx.probe_pending)
+        self.assertEqual(ctx.probe_error, 'CLI not found')
+        self.assertEqual(ctx.detected, 0)
+        fake_ctrl.start_monitor.assert_called_once_with()
+
+    def test_probe_exception_sets_probe_error(self):
+        def boom(run):
+            raise RuntimeError('i2c gone')
+
+        ctx, fake_ctrl, runner, probe_mock = self._make(probe_impl=boom)
+        self.assertTrue(self._wait_probe(ctx))
+        self.assertFalse(ctx.probe_pending)
+        self.assertIn('i2c gone', ctx.probe_error)
+
+    def test_cli_lock_serializes_concurrent_run_calls(self):
+        ctx, fake_ctrl, runner, probe_mock = self._make()
+        started = threading.Event()
+        done = threading.Event()
+        calls = []
+
+        def worker():
+            started.set()
+            ctx.run('disk1', '-status')
+            calls.append('ran')
+            done.set()
+
+        ctx._cli_lock.acquire()
+        t = threading.Thread(target=worker)
+        t.start()
+        self.assertTrue(started.wait(1))
+        self.assertFalse(done.wait(0.3),
+                         'run() must block while the CLI lock is held')
+        ctx._cli_lock.release()
+        self.assertTrue(done.wait(2), 'run() must proceed after lock release')
+        t.join(2)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(calls, ['ran'])
+        runner.assert_called_once_with('disk1', '-status')
+
+    def test_run_delegates_to_underlying_runner(self):
+        ctx, fake_ctrl, runner, probe_mock = self._make()
+        ctx.run('all', '-status')
+        runner.assert_called_once_with('all', '-status')
 
 
 if __name__ == '__main__':

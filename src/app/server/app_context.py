@@ -1,6 +1,8 @@
 """Application bootstrap and shared runtime context."""
 
 import os
+import threading
+import time
 
 from auth_manager import AuthManager
 from pilot_core import (
@@ -28,13 +30,22 @@ class AppContext:
     """Mutable app state shared by HTTP handlers."""
 
     def __init__(self):
-        self.run = make_cli_runner(CLI)
+        # All CLI (I2C) access shares one lock so the background probe and
+        # any restore/set calls never interleave on the bus.
+        self._cli_lock = threading.Lock()
+        self.run = self._locked(make_cli_runner(CLI))
         self.auth = AuthManager(AUTH_FILE)
         self.broadcaster = StatusBroadcaster()
         self.model_info = detect_model()
-        self.led_statuses, self.probe_error = probe_leds(self.run)
-        self.detected = disk_count_from_leds(self.led_statuses)
-        self.hardware_modes = {led: d['mode'] for led, d in self.led_statuses.items()}
+        # Probe runs in a background thread: startup never blocks on the CLI.
+        # Until it finishes, state stays empty and probe_pending is True.
+        self.probe_pending = True
+        self.led_statuses = {}
+        self.probe_error = ''
+        self.detected = 0
+        self.hardware_modes = {}
+        threading.Thread(target=self._probe_async, name='led-probe',
+                         daemon=True).start()
         self.initialized = os.path.exists(CONFIG_FILE)
         self.default_disk_count = DXP4800_PLUS_PROFILE['disk_count']
         self.cfg = load_json(CONFIG_FILE, self._default_config())
@@ -53,6 +64,30 @@ class AppContext:
         )
         self.ctrl.restore_state(hardware_modes=self.hardware_modes, apply_hardware=True)
         self.ctrl.start_monitor()
+
+    def _locked(self, run):
+        """Wrap a CLI runner so every invocation is serialized by _cli_lock."""
+        def locked(*args, **kwargs):
+            with self._cli_lock:
+                return run(*args, **kwargs)
+        return locked
+
+    def _probe_async(self):
+        """Background LED probe; publishes results once, then clears
+        probe_pending. Ready-after-write: HTTP threads only read these
+        fields, so no extra locking is needed."""
+        start = time.monotonic()
+        try:
+            led_statuses, probe_error = probe_leds(self.run)
+        except Exception as e:  # never crash the daemon thread silently
+            led_statuses, probe_error = {}, str(e)
+        self.led_statuses = led_statuses
+        self.probe_error = probe_error
+        self.detected = disk_count_from_leds(led_statuses)
+        self.hardware_modes = {led: d['mode'] for led, d in led_statuses.items()}
+        self.probe_pending = False
+        print(f'[AppContext] LED probe done in {time.monotonic() - start:.2f}s'
+              f' — {len(led_statuses)} LEDs detected, error={probe_error!r}')
 
     def _default_config(self):
         return {

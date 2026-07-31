@@ -109,6 +109,7 @@ class PilotHandler(BaseHTTPRequestHandler):
                 'config': self.app.cfg,
                 'detected': self.app.detected,
                 'probe_error': self.app.probe_error,
+                'probe_pending': getattr(self.app, 'probe_pending', False),
             })
         return self._json(404, {'success': False})
 
@@ -278,6 +279,9 @@ class PilotHandler(BaseHTTPRequestHandler):
     def _all(self, mode):
         if not validate_mode(mode):
             return self._json(400, {'success': False, 'message': '无效模式'})
+        if mode == 'off':
+            ok, msg = self.app.ctrl.all_off()
+            return self._json(200 if ok else 500, {'success': ok, 'message': msg})
         errors = []
         for led in self.app.led_names:
             ok, msg = self.app.ctrl.set_mode(led, mode)
