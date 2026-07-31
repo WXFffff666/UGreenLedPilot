@@ -1,0 +1,49 @@
+#!/bin/bash
+# LED Controller — Pre-uninstall: restore the original LED state
+# that was captured at install time. This prevents the I2C LED
+# controller (address 0x3a) from persisting the app's LED state
+# after app removal.
+
+STATE_FILE="${TRIM_PKGVAR}/original_led_state.txt"
+CLI="/usr/local/bin/ugreen_leds_cli"
+BUNDLED="${TRIM_APPDEST}/server/ugreen_leds_cli"
+
+echo "=== FnUGreenLed Uninstall — Restoring Original LED State ==="
+
+# Find a working CLI binary
+CLI_PATH=""
+for CANDIDATE in "$CLI" "$BUNDLED"; do
+    if [ -f "$CANDIDATE" ] && [ -x "$CANDIDATE" ]; then
+        CLI_PATH="$CANDIDATE"
+        break
+    fi
+done
+if [ -z "$CLI_PATH" ]; then
+    echo "  WARNING: CLI binary not found. LEDs may need a power cycle."
+    exit 0
+fi
+
+if [ -f "$STATE_FILE" ]; then
+    echo "  Restoring original LED state..."
+    while IFS= read -r line; do
+        # Parse: "power: status = on, brightness = 255, color = RGB(255,255,255)"
+        led=$(echo "$line" | sed -n 's/^\([a-z0-9]*\):.*$/\1/p')
+        status=$(echo "$line" | sed -n 's/.*status = \([a-z]*\).*$/\1/p')
+        r=$(echo "$line" | sed -n 's/.*color = RGB(\([0-9]*\), \([0-9]*\), \([0-9]*\)).*$/\1/p')
+        g=$(echo "$line" | sed -n 's/.*color = RGB(\([0-9]*\), \([0-9]*\), \([0-9]*\)).*$/\2/p')
+        b=$(echo "$line" | sed -n 's/.*color = RGB(\([0-9]*\), \([0-9]*\), \([0-9]*\)).*$/\3/p')
+        if [ -n "$led" ] && [ -n "$status" ]; then
+            case "$status" in
+                on)    "$CLI_PATH" "$led" -on -color "$r" "$g" "$b" 2>/dev/null ;;
+                off)   "$CLI_PATH" "$led" -off 2>/dev/null ;;
+                blink|breath) "$CLI_PATH" "$led" -on -color "$r" "$g" "$b" 2>/dev/null ;;
+            esac
+        fi
+    done < "$STATE_FILE"
+    echo "  Original state restored."
+else
+    echo "  No saved state found. Setting warm white default..."
+    "$CLI_PATH" all -on -color 255 200 100 -brightness 128 2>/dev/null
+fi
+echo "=== Uninstall LED restore complete ==="
+exit 0

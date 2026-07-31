@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install fnpack
+        run: |
+          curl -fsSL https://static2.fnnas.com/fnpack/fnpack-1.2.1-linux-amd64 -o fnpack
+          chmod +x fnpack
+          sudo mv fnpack /usr/local/bin/fnpack
+
+      - name: Build ugreen_leds_cli
+        run: |
+          docker run --platform linux/amd64 --rm \
+            -v "$PWD/src/app/server":/output \
+            -w /build alpine:latest sh -c '
+              apk add --no-cache git g++ make linux-headers
+              git clone --depth 1 https://github.com/miskcoo/ugreen_leds_controller.git
+              cd ugreen_leds_controller/cli && make
+              cp ugreen_leds_cli /output/
+            '
+
+      - name: Build fpk
+        working-directory: src
+        run: fnpack build
+
+      - name: Collect artifact
+        run: |
+          VERSION=$(grep '^version' src/manifest | awk -F= '{print $2}' | tr -d ' ')
+          mkdir -p build
+          cp src/UGreenLedPilot.fpk "build/UGreenLedPilot-${VERSION}.x86_64.fpk"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*.fpk
+          generate_release_notes: true

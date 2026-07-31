@@ -1,0 +1,12 @@
+{
+    "id": "dxp6800pro",
+    "name": "DXP6800 Pro",
+    "disk_count": 6,
+    "leds": ["power", "netdev", "disk1", "disk2", "disk3", "disk4", "disk5", "disk6"],
+    "i2c_bus": 1,
+    "i2c_addr": "0x3a",
+    "driver": "ugreen_leds_cli",
+    "supported": true,
+    "verified": false,
+    "note": "社区报告可用（#7），待更多验证"
+}

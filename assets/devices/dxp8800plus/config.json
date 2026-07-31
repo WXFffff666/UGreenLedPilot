@@ -1,0 +1,12 @@
+{
+    "id": "dxp8800plus",
+    "name": "DXP8800 Plus",
+    "disk_count": 8,
+    "leds": ["power", "netdev", "disk1", "disk2", "disk3", "disk4", "disk5", "disk6", "disk7", "disk8"],
+    "i2c_bus": 1,
+    "i2c_addr": "0x3a",
+    "driver": "ugreen_leds_cli",
+    "supported": true,
+    "verified": false,
+    "note": "社区报告可用，另有 meyergru 的独立适配仓库"
+}

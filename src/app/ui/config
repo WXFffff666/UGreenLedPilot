@@ -1,0 +1,13 @@
+{
+    ".url": {
+        "UGreenLedPilot.Application": {
+            "title": "UGreen LED Pilot",
+            "icon": "images/icon_{0}.png",
+            "type": "url",
+            "protocol": "",
+            "port": "19580",
+            "url": "/",
+            "allUsers": false
+        }
+    }
+}

@@ -1,0 +1,8 @@
+#!/bin/bash
+# LED Controller — Post-uninstall: final LED state check.
+# The uninstall_init should have turned off LEDs. 
+# This is a safety net if the binary was already removed.
+
+echo "=== FnUGreenLed Uninstall Callback ==="
+echo "fnOS will clean up app files and symlinks automatically."
+exit 0

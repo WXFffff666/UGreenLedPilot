@@ -1,0 +1,12 @@
+{
+    "id": "dx4700plus",
+    "name": "DX4700+",
+    "disk_count": 4,
+    "leds": ["power", "netdev", "disk1", "disk2", "disk3", "disk4"],
+    "i2c_bus": 1,
+    "i2c_addr": "0x3a",
+    "driver": "ugreen_leds_cli",
+    "supported": true,
+    "verified": true,
+    "note": "作者自测通过，旧款型号"
+}

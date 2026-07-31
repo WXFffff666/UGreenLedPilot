@@ -1,0 +1,12 @@
+{
+    "id": "dxp4800plus",
+    "name": "DXP4800 Plus",
+    "disk_count": 4,
+    "leds": ["power", "netdev", "disk1", "disk2", "disk3", "disk4"],
+    "i2c_bus": 1,
+    "i2c_addr": "0x3a",
+    "driver": "ugreen_leds_cli",
+    "supported": true,
+    "verified": true,
+    "note": "社区报告可用，前面板带显示屏，外观与 DXP4800 不同"
+}

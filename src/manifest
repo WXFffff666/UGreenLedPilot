@@ -1,0 +1,12 @@
+appname               = UGreenLedPilot
+version               = 1.0.0
+display_name          = UGreen LED Pilot
+desc                  = 绿联 NAS 机箱 LED 智能控制。支持开关/亮度/颜色/自动模式（插盘亮、拔盘灭、活动闪烁），ATA 机型盘位映射，事件驱动热插拔重映射。管理员密码鉴权，仅授权用户可控制。
+arch                  = x86_64
+source                = thirdparty
+maintainer            = WXFffff666
+distributor           = WXFffff666
+desktop_uidir         = ui
+desktop_applaunchname = UGreenLedPilot.Application
+service_port          = 19580
+changelog             = v1.0.0: 独立发布。事件驱动热插拔、管理员鉴权、颜色预设、自动闪烁、默认白灯+橙色网口灯。

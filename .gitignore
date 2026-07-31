@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Build output
+build/
+*.fpk
+fnpack.exe
+fnpack
+
+# Tools checkout (reference only)
+tools/ugreen_leds_controller/
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# Claude Code local settings (contains personal config)
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc

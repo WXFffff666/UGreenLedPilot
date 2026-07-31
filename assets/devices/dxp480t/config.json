@@ -1,0 +1,12 @@
+{
+    "id": "dxp480t",
+    "name": "DXP480T",
+    "disk_count": 4,
+    "leds": ["power"],
+    "i2c_bus": 0,
+    "i2c_addr": "0x26",
+    "driver": "i2cset",
+    "supported": false,
+    "verified": false,
+    "note": "全 NVMe SSD NAS，仅有一个白光/红光电源 LED。I2C 布局与其他型号完全不同，不支持 ugreen_leds_cli。需通过 i2cset 直接操作寄存器（0x50/0x51/0xb1/0xa0）。计划后续版本适配。"
+}

@@ -1,0 +1,11 @@
+[
+    {"id": "dxp4800",  "name": "DXP4800",        "disk_count": 4, "verified": true,  "image": true},
+    {"id": "dxp2800",  "name": "DXP2800",         "disk_count": 2, "verified": false, "image": false},
+    {"id": "dxp4800plus","name": "DXP4800 Plus",  "disk_count": 4, "verified": true, "image": false},
+    {"id": "dxp6800pro","name": "DXP6800 Pro",    "disk_count": 6, "verified": false, "image": false},
+    {"id": "dxp8800plus","name": "DXP8800 Plus",  "disk_count": 8, "verified": false, "image": false},
+    {"id": "dx4600pro", "name": "DX4600 Pro",     "disk_count": 4, "verified": true,  "image": false},
+    {"id": "dx4700plus","name": "DX4700+",        "disk_count": 4, "verified": true,  "image": false},
+    {"id": "dxp480t",   "name": "DXP480T",        "disk_count": 4, "verified": false, "image": false,
+     "note": "仅电源LED，I2C 0x26，待适配"}
+]

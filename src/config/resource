@@ -1,0 +1,35 @@
+{
+    "data-share":
+    {
+        "shares":
+        [
+            {
+                "name": "FnUGreenLed",
+                "permission":
+                {
+                    "rw":
+                    [
+                        "ledcontroller"
+                    ]
+                }
+            },
+            {
+                "name": "FnUGreenLed/data",
+                "permission":
+                {
+                    "rw":
+                    [
+                        "ledcontroller"
+                    ]
+                }
+            }
+        ]
+    },
+    "usr-local-linker":
+    {
+        "bin":
+        [
+            "server/ugreen_leds_cli"
+        ]
+    }
+}
