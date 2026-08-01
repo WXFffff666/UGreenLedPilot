@@ -4,7 +4,7 @@
 
 基于 [miskcoo/ugreen_leds_controller](https://github.com/miskcoo/ugreen_leds_controller) 的 `ugreen_leds_cli` 驱动，所有硬件操作均通过该 CLI 完成，无其他控制路径。
 
-**当前版本：v2.2.0** · [下载 Release](https://github.com/WXFffff666/UGreenLedPilot/releases/tag/v2.2.0)
+**当前版本：v2.2.1** · [下载 Release](https://github.com/WXFffff666/UGreenLedPilot/releases/tag/v2.2.1)
 
 ---
 
@@ -95,7 +95,7 @@ src/app/server/
 
 ## 安装
 
-1. 从 [Releases](https://github.com/WXFffff666/UGreenLedPilot/releases) 下载 `UGreenLedPilot-2.2.0.x86_64.fpk`
+1. 从 [Releases](https://github.com/WXFffff666/UGreenLedPilot/releases) 下载 `UGreenLedPilot-2.2.1.x86_64.fpk`
 2. 飞牛应用中心 → 手动安装
 3. 打开应用，默认密码 `admin123`（**请立即修改**，至少 8 位，最长 128 位）
 
@@ -164,6 +164,7 @@ src/app/server/
 
 | 版本 | 要点 |
 |------|------|
+| **v2.2.1** | bugfix：热插拔修复（H1 拔盘灭、H2 网口灭灯）；chase 门控与 identify 超时；安全加固（origin/body）；设置定时器竞态；性能双重映射 |
 | **v2.2.0** | 效果模式（呼吸/手动闪烁/跑马灯演示）；速度感知闪烁；单用户鉴权；多网口活动聚合；盘位校准；性能优化与可靠性修复；玻璃拟态 UI 美化 |
 | **v2.1.0** | netlink uevent 零轮询热插拔；分层监控休眠；活动闪烁可关；玻璃拟态 UI |
 | **v2.0.0** | 模块化重构；SSE 替代轮询；CLI 去重；独立 www 前端 |

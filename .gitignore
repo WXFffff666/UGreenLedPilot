@@ -20,3 +20,4 @@ tools/ugreen_leds_controller/
 # Python
 __pycache__/
 *.pyc
+*.bak

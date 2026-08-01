@@ -1,6 +1,6 @@
 appname               = UGreenLedPilot
 
-version               = 2.2.0
+version               = 2.2.1
 
 display_name          = UGreen LED Pilot
 
@@ -20,5 +20,5 @@ desktop_applaunchname = UGreenLedPilot.Application
 
 service_port          = 19580
 
-changelog             = v2.2.0: 效果模式（呼吸/手动闪烁/跑马灯演示）+ 速度感知闪烁；单用户鉴权；多网口活动聚合；盘位校准 UI；性能优化与可靠性修复；玻璃拟态 UI 美化。CLI pin 上游 af2b7ae。
+changelog             = v2.2.1: bugfix——热插拔修复（H1 拔盘灭去重键、H2 网口灭灯）；chase 门控与 identify 超时；安全加固（origin 端口校验、body 防护）；设置定时器竞态；性能双重映射修复。CLI pin 上游 af2b7ae。
 
