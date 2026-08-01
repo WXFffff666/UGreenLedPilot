@@ -19,8 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src' / 'app' / 'se
 
 from pilot_core import (
     map_disks_by_profile, disk_signature, net_signature, list_net_ifaces,
-    quick_hardware_signature, DEFAULT_SETTINGS, NETDEV_ORANGE, WHITE,
+    DEFAULT_SETTINGS, NETDEV_ORANGE, WHITE,
     DXP4800_PLUS_PROFILE, EFFECT_PRIORITY, PilotController, StatusBroadcaster,
+    IDENTIFY_DURATION,
 )
 from auth_manager import AuthManager, PBKDF2_ITERATIONS
 from http_handler import PilotHandler
@@ -86,7 +87,6 @@ class TestHotplugSignature(unittest.TestCase):
     def test_signatures_are_hashable(self):
         self.assertIsInstance(disk_signature(), tuple)
         self.assertIsInstance(net_signature(), tuple)
-        self.assertIsInstance(quick_hardware_signature(), tuple)
 
 
 class TestModeAwareHotplug(_PilotTestCase):
@@ -371,7 +371,9 @@ class TestSpeedAwareBlink(_PilotTestCase):
         ctrl = self._make_ctrl()
         self._seed_net(ctrl)
         # 30KB/s in 1s — below 100KB/s → steady on, no -blink
-        with patch('pilot_core.read_stats', side_effect=[130000, 0]):
+        with patch('pilot_core.read_stats', side_effect=[130000, 0]), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'):
             self.assertTrue(ctrl._check_network())
         ctrl.run.assert_called_once_with(
             'netdev', '-on', '-color', '255', '165', '0', '-brightness', '255')
@@ -380,7 +382,9 @@ class TestSpeedAwareBlink(_PilotTestCase):
         ctrl = self._make_ctrl()
         self._seed_net(ctrl)
         # 500KB/s in 1s → 400/400
-        with patch('pilot_core.read_stats', side_effect=[600000, 0]):
+        with patch('pilot_core.read_stats', side_effect=[600000, 0]), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'):
             self.assertTrue(ctrl._check_network())
         ctrl.run.assert_called_once_with(
             'netdev', '-on', '-blink', '400', '400',
@@ -390,7 +394,9 @@ class TestSpeedAwareBlink(_PilotTestCase):
         ctrl = self._make_ctrl()
         self._seed_net(ctrl)
         # 2.4MB/s in 1s → 100/100
-        with patch('pilot_core.read_stats', side_effect=[2500000, 0]):
+        with patch('pilot_core.read_stats', side_effect=[2500000, 0]), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'):
             self.assertTrue(ctrl._check_network())
         ctrl.run.assert_called_once_with(
             'netdev', '-on', '-blink', '100', '100',
@@ -399,11 +405,15 @@ class TestSpeedAwareBlink(_PilotTestCase):
     def test_rate_tier_change_retriggers_cli(self):
         ctrl = self._make_ctrl()
         self._seed_net(ctrl)
-        with patch('pilot_core.read_stats', side_effect=[600000, 0]):
+        with patch('pilot_core.read_stats', side_effect=[600000, 0]), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'):
             ctrl._check_network()  # 500KB/s → 400/400
         ctrl.run.reset_mock()
         ctrl._last_net_check = time.monotonic() - 1.0
-        with patch('pilot_core.read_stats', side_effect=[2500000, 0]):
+        with patch('pilot_core.read_stats', side_effect=[2500000, 0]), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'):
             self.assertTrue(ctrl._check_network())  # 2.4MB/s → 100/100
         ctrl.run.assert_called_once_with(
             'netdev', '-on', '-blink', '100', '100',
@@ -412,18 +422,24 @@ class TestSpeedAwareBlink(_PilotTestCase):
     def test_same_rate_tier_deduped(self):
         ctrl = self._make_ctrl()
         self._seed_net(ctrl)
-        with patch('pilot_core.read_stats', side_effect=[600000, 0]):
+        with patch('pilot_core.read_stats', side_effect=[600000, 0]), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'):
             ctrl._check_network()  # 500KB/s → 400/400
         ctrl.run.reset_mock()
         ctrl._last_net_check = time.monotonic() - 1.0
-        with patch('pilot_core.read_stats', side_effect=[1150000, 0]):
+        with patch('pilot_core.read_stats', side_effect=[1150000, 0]), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'):
             self.assertFalse(ctrl._check_network())  # 550KB/s → still 400/400
         ctrl.run.assert_not_called()
 
     def test_speed_blink_disabled_keeps_fixed_blink(self):
         ctrl = self._make_ctrl(speed_blink=False)
         self._seed_net(ctrl)
-        with patch('pilot_core.read_stats', side_effect=[600000, 0]):
+        with patch('pilot_core.read_stats', side_effect=[600000, 0]), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'):
             self.assertTrue(ctrl._check_network())
         ctrl.run.assert_called_once_with(
             'netdev', '-on', '-blink', '80', '120',
@@ -471,6 +487,10 @@ class _FakeChaseClock:
 
     def advance(self, dt):
         self.now += dt
+
+
+class _FakeMonotonic(_FakeChaseClock):
+    """Fake time.monotonic — same call/advance shape as _FakeChaseClock."""
 
 
 class _FakeLoopEvents:
@@ -638,7 +658,9 @@ class TestChaseEffect(_PilotTestCase):
         ctrl.run.reset_mock()
 
         # sustained traffic -> netdev activity-blink; chase must not advance
-        with patch('pilot_core.read_stats', side_effect=[1100, 2000, 1300, 2000, 1500, 2000]):
+        with patch('pilot_core.read_stats', side_effect=[1100, 2000, 1300, 2000, 1500, 2000]), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'):
             ctrl._stop = _FakeLoopEvents(3)
             ctrl._wake_event = _FakeLoopEvents(3)
             ctrl._monitor_loop()
@@ -649,12 +671,83 @@ class TestChaseEffect(_PilotTestCase):
         self.assertEqual(ctrl._activity_idle_rounds, 0)
 
         # traffic stops -> chase resumes stepping
-        with patch('pilot_core.read_stats', side_effect=[1500, 2000, 1500, 2000]):
+        with patch('pilot_core.read_stats', side_effect=[1500, 2000, 1500, 2000]), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'):
             ctrl._stop = _FakeLoopEvents(2)
             ctrl._wake_event = _FakeLoopEvents(2)
             ctrl._monitor_loop()
         self.assertTrue(any(c.args[0] == 'disk1' and '-off' not in c.args
                             for c in ctrl.run.call_args_list))
+
+    def test_c3_chase_blinkoff_no_activity_blink(self):
+        """C3: chase + activity-blink off + auto netdev with traffic must not
+        -blink. The IO checks are gated by _has_auto_activity_targets (M2);
+        only the chase demo steps."""
+        ctrl = self._make_ctrl()
+        self._all_off(ctrl)
+        ctrl.modes['netdev'] = 'auto'
+        ctrl.activity_blink_enabled = False
+        ctrl._net_iface = 'eth0'
+        ctrl._net_ifaces = ['eth0']
+        ctrl._prev_net_rx = {'eth0': 1000}
+        ctrl._prev_net_tx = {'eth0': 2000}
+        ctrl.activity['netdev'] = False
+        clock = _FakeChaseClock()
+        ctrl._chase_clock = clock
+        ctrl.set_chase(True)
+        ctrl.run.reset_mock()
+
+        # sustained traffic would previously blink netdev despite blink off
+        with patch('pilot_core.read_stats', side_effect=[1100, 2000, 1300, 2000]), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'):
+            ctrl._stop = _FakeLoopEvents(2)
+            ctrl._wake_event = _FakeLoopEvents(2)
+            ctrl._monitor_loop()
+        self.assertFalse(any('-blink' in c.args for c in ctrl.run.call_args_list))
+        # chase still steps despite the blink-off gate
+        self.assertTrue(any(c.args[0] == 'disk1' and '-off' not in c.args
+                            for c in ctrl.run.call_args_list))
+
+
+class TestIdentifyExpiry(_PilotTestCase):
+    """C4: identify() self-expires — an off/steady LED is restored to its
+    mode after IDENTIFY_DURATION instead of blinking forever."""
+
+    def _make_ctrl(self):
+        ctrl = super()._make_ctrl()
+        ctrl._uevent = MagicMock()
+        ctrl._uevent.is_running.return_value = False
+        return ctrl
+
+    def test_c4_identify_timeout_revert(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes = {'power': 'on', 'netdev': 'off', 'disk1': 'off', 'disk2': 'off'}
+        clock = _FakeMonotonic(now=100.0)
+        with patch('pilot_core.time.monotonic', clock):
+            ok, _ = ctrl.identify('disk1')  # deadline = 100 + IDENTIFY_DURATION
+            self.assertTrue(ok)
+            self.assertEqual(ctrl._identify_until, 100.0 + IDENTIFY_DURATION)
+            self.assertEqual(ctrl._identify_led, 'disk1')
+            ctrl.run.reset_mock()
+
+            # before the deadline: no restore CLI
+            ctrl._stop = _FakeLoopEvents(1)
+            ctrl._wake_event = _FakeLoopEvents(1)
+            ctrl._monitor_loop()
+            self.assertFalse(any(c.args[0] == 'disk1' and '-off' in c.args
+                                 for c in ctrl.run.call_args_list))
+
+            # past the deadline: LED restored to its mode, timer reset
+            clock.advance(IDENTIFY_DURATION + 1.0)
+            ctrl.run.reset_mock()
+            ctrl._stop = _FakeLoopEvents(1)
+            ctrl._wake_event = _FakeLoopEvents(1)
+            ctrl._monitor_loop()
+        self.assertTrue(any(c.args[0] == 'disk1' and '-off' in c.args
+                            for c in ctrl.run.call_args_list))
+        self.assertEqual(ctrl._identify_until, 0.0)
 
 
 class TestEffectPriorityMatrix(_PilotTestCase):
@@ -850,6 +943,27 @@ class TestEffectPriorityMatrix(_PilotTestCase):
             self.assertEqual(saved['custom_key'], 'keep-me')
             self.assertEqual(saved['effects'], {'power': 'manual-blink'})
 
+    def test_r6_stale_timer_epoch(self):
+        """R6: a settings-save timer captured before a stop must not write.
+
+        stop_monitor bumps _settings_epoch so a pending 0.8s timer from the
+        old controller (which captured the old epoch) skips its flush —
+        otherwise it would overwrite the settings file with stale state
+        after a reset/rebuild.
+        """
+        ctrl = self._make_ctrl()
+        ctrl.set_color('power', 10, 20, 30)  # dirty + schedules a save (epoch 0)
+        stale_epoch = ctrl._settings_epoch
+        ctrl._settings_epoch += 1  # what stop_monitor does before a rebuild
+        with patch('pilot_core.save_json') as save_mock:
+            ctrl._flush_settings(stale_epoch)  # stale timer fires
+            save_mock.assert_not_called()
+        self.assertTrue(ctrl._settings_dirty)  # pending change not dropped
+        ctrl._flush_settings()  # a fresh flush still persists
+        with open(self._settings_file) as f:
+            saved = json.load(f)
+        self.assertEqual(saved['power']['color'], [10, 20, 30])
+
 
 class TestMultiNicMonitoring(_PilotTestCase):
     """E13/F2: aggregate rx/tx across all NICs (DXP4800 Plus dual 2.5G)."""
@@ -863,7 +977,9 @@ class TestMultiNicMonitoring(_PilotTestCase):
         ctrl._prev_net_tx = {'eth0': 2000, 'eth1': 600}
         ctrl.activity['netdev'] = False
         # eth0 idle; only eth1 sees traffic (rx 500 -> 550)
-        with patch('pilot_core.read_stats', side_effect=[1000, 2000, 550, 600]):
+        with patch('pilot_core.read_stats', side_effect=[1000, 2000, 550, 600]), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0', 'eth1']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'):
             changed = ctrl._check_network()
         self.assertTrue(changed)
         self.assertTrue(ctrl.activity['netdev'])
@@ -944,6 +1060,184 @@ class TestMultiNicMonitoring(_PilotTestCase):
         self.assertFalse(any('-blink' in call.args for call in ctrl.run.call_args_list))
 
 
+class TestH1PresenceDedup(_PilotTestCase):
+    """H1: the dedup key must encode disk presence.
+
+    Otherwise a pull/replug while the disk is idle (steady-on) produces the
+    identical key as the idle state, the dedup skips _apply, and the CLI
+    -off/-on transition never reaches the hardware (LED stays lit / dark).
+    """
+
+    def test_h1_remove_while_idle_off(self):
+        ctrl = self._make_ctrl()
+        ctrl._disk_map = {1: 'sda'}
+        ctrl.modes['disk1'] = 'auto'
+        ctrl.activity['disk1'] = False
+        ctrl.presence['disk1'] = True
+        # Disk present + idle -> steady-on applied (seeds _last_applied)
+        with patch('pilot_core.disk_present', return_value=True):
+            ctrl._apply('disk1', 'auto', activity=False)
+        ctrl.run.reset_mock()
+        # Disk removed while idle -> -off must NOT be deduped away
+        with patch('pilot_core.disk_present', return_value=False):
+            self.assertTrue(ctrl._check_disks())
+        ctrl.run.assert_called_once_with('disk1', '-off')
+        self.assertFalse(ctrl.presence['disk1'])
+
+    def test_h1_replug_while_idle_on(self):
+        ctrl = self._make_ctrl()
+        ctrl._disk_map = {1: 'sda'}
+        ctrl.modes = {'power': 'off', 'netdev': 'off', 'disk1': 'auto', 'disk2': 'off'}
+        ctrl.activity['disk1'] = False
+        ctrl.presence['disk1'] = False
+        # Disk absent + idle -> -off applied (seeds _last_applied with absent key)
+        with patch('pilot_core.disk_present', return_value=False):
+            ctrl._apply('disk1', 'auto', activity=False)
+        ctrl.run.reset_mock()
+        # Disk re-plugged while idle -> steady -on must be re-issued
+        with patch('pilot_core.disk_present', return_value=True), \
+                patch('pilot_core.detect_disks', return_value={1: 'sda'}), \
+                patch('pilot_core.detect_net_iface', return_value=None), \
+                patch('pilot_core.list_net_ifaces', return_value=[]), \
+                patch('pilot_core.read_disk_io', return_value=0):
+            ctrl._on_hardware_changed()
+        ctrl.run.assert_called_once_with(
+            'disk1', '-on', '-color', '255', '255', '255', '-brightness', '255')
+
+
+class TestH2AllNicsDown(_PilotTestCase):
+    """H2: all NICs down must turn the netdev LED off even when idle.
+
+    The old _check_network returned early (no -off) whenever _net_iface was
+    None AND activity was already False, so a cable unplug while the netdev
+    LED was steady-on left it lit forever.
+    """
+
+    def test_h2_all_nics_down_netdev_off(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes = {'power': 'off', 'netdev': 'auto', 'disk1': 'off', 'disk2': 'off'}
+        ctrl._net_iface = 'eth0'
+        ctrl._net_ifaces = ['eth0']
+        ctrl.activity['netdev'] = False
+        ctrl.presence['netdev'] = True
+        # NICs up + idle -> steady-on applied (seeds _last_applied)
+        ctrl._apply('netdev', 'auto', activity=False)
+        # All NICs go down (cable unplug); activity is already False
+        ctrl._net_iface = None
+        ctrl.run.reset_mock()
+        with patch('pilot_core.list_net_ifaces', return_value=[]), \
+                patch('pilot_core.detect_net_iface', return_value=None):
+            self.assertTrue(ctrl._check_network())
+        ctrl.run.assert_called_once_with('netdev', '-off')
+        self.assertFalse(ctrl.activity['netdev'])
+
+
+class TestC5ClockSeeded(_PilotTestCase):
+    """C5: speed-blink clocks must be seeded at monitor start / hotplug.
+
+    Unseeded _last_net_check / _last_disk_check made the first activity tick
+    compute elapsed=0 -> blink_params=None -> a spurious steady-on flash, and
+    left the clocks stale after re-enabling speed-blink.
+    """
+
+    def test_c5_clock_seeded(self):
+        ctrl = self._make_ctrl()
+        with patch('pilot_core.detect_disks', return_value={1: 'sda'}), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'), \
+                patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.read_stats', side_effect=[10, 20]), \
+                patch('pilot_core.disk_present', return_value=True), \
+                patch('pilot_core.read_disk_io', return_value=0):
+            ctrl.start_monitor()
+            ctrl.stop_monitor()
+        self.assertIsNotNone(ctrl._last_net_check)
+        self.assertIn(1, ctrl._last_disk_check)
+
+
+class TestP1SingleRemap(_PilotTestCase):
+    """P1: _on_hardware_changed must refresh _disk_sig/_net_sig.
+
+    Otherwise the 120s fallback scan (_maybe_rescan) compares against the
+    stale pre-hotplug signature and triggers a second full remap.
+    """
+
+    def test_p1_single_remap_per_hotplug(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes = {'power': 'off', 'netdev': 'off', 'disk1': 'auto', 'disk2': 'off'}
+        ctrl._disk_map = {1: 'sda'}
+        with patch('pilot_core.detect_disks', return_value={1: 'sdb'}), \
+                patch('pilot_core.detect_net_iface', return_value=None), \
+                patch('pilot_core.list_net_ifaces', return_value=[]), \
+                patch('pilot_core.disk_present', return_value=True), \
+                patch('pilot_core.read_disk_io', return_value=0), \
+                patch('pilot_core.disk_signature', return_value=(('sdb', '0:0:0:0', 'SN'),)), \
+                patch('pilot_core.net_signature', return_value=()):
+            # uevent-driven remap (sda -> sdb) — exactly one remap
+            ctrl._on_hardware_changed()
+            self.assertEqual(ctrl._rescan_count, 1)
+            # the fallback scan must see the post-remap signature: no second remap
+            self.assertFalse(ctrl._maybe_rescan())
+            self.assertEqual(ctrl._rescan_count, 1)
+
+
+class TestR1ProbeOutsideLock(_PilotTestCase):
+    """R1: hardware probes (lsblk subprocess) must not run under _lock.
+
+    A hung lsblk (5s timeout) under the lock would block every UI mutation
+    (set_color/set_mode/...). force_remap is the API path that used to hold
+    the lock across _on_hardware_changed's probes.
+    """
+
+    def test_r1_detect_outside_lock(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes = {'power': 'off', 'netdev': 'off', 'disk1': 'auto', 'disk2': 'off'}
+        ctrl._disk_map = {1: 'sda'}
+        lock_held_at_probe = []
+
+        def probing_detect(*args, **kwargs):
+            # RLock._is_owned(): True when the calling thread holds the lock
+            lock_held_at_probe.append(ctrl._lock._is_owned())
+            return {1: 'sda'}
+
+        with patch('pilot_core.detect_disks', side_effect=probing_detect), \
+                patch('pilot_core.detect_net_iface', return_value=None), \
+                patch('pilot_core.list_net_ifaces', return_value=[]), \
+                patch('pilot_core.disk_present', return_value=True), \
+                patch('pilot_core.read_disk_io', return_value=0), \
+                patch('pilot_core.disk_signature', return_value=()), \
+                patch('pilot_core.net_signature', return_value=()):
+            ctrl.force_remap()
+        self.assertEqual(lock_held_at_probe, [False])
+        self.assertEqual(ctrl._disk_map, {1: 'sda'})
+
+
+class TestC6BlinkParamsPreserved(_PilotTestCase):
+    """C6: set_color/set_brightness/set_effect during a speed-aware blink
+    must keep the blink rhythm.
+
+    Dropping blink_params made _apply fall into the speed-blink branch and
+    flash the LED steady-on until the next activity tick.
+    """
+
+    def test_c6_blink_params_preserved(self):
+        ctrl = self._make_ctrl(speed_blink=True)
+        ctrl.modes = {'power': 'off', 'netdev': 'off', 'disk1': 'auto', 'disk2': 'off'}
+        ctrl.activity['disk1'] = True
+        ctrl._disk_map = {1: 'sda'}
+        with patch('pilot_core.disk_present', return_value=True):
+            # speed-aware blink in progress (fast tier 100/100)
+            ctrl._apply('disk1', 'auto', activity=True, blink_params=(100, 100))
+        ctrl.run.reset_mock()
+        with patch('pilot_core.disk_present', return_value=True), \
+                patch.object(ctrl, '_apply', wraps=ctrl._apply) as spy:
+            ok, _ = ctrl.set_color('disk1', 10, 20, 30)
+        self.assertTrue(ok)
+        self.assertEqual(spy.call_args.kwargs['blink_params'], (100, 100))
+        ctrl.run.assert_called_once_with(
+            'disk1', '-on', '-blink', '100', '100',
+            '-color', '10', '20', '30', '-brightness', '255')
+
+
 class TestBroadcaster(unittest.TestCase):
     def test_publish_notify(self):
         bc = StatusBroadcaster()
@@ -951,6 +1245,21 @@ class TestBroadcaster(unittest.TestCase):
         bc.publish({'modes': {'power': 'on'}})
         self.assertEqual(len(q), 1)
         self.assertTrue(ev.is_set())
+
+
+class TestM7StatusVersion(_PilotTestCase):
+    """M7-server: get_status/get_live_status expose the broadcaster version."""
+
+    def test_m7_status_version_present(self):
+        ctrl = self._make_ctrl()
+        self.assertEqual(ctrl.get_live_status()['version'], 0)
+        self.assertEqual(ctrl.get_status()['version'], 0)
+        ctrl.broadcaster.publish({'modes': dict(ctrl.modes)})
+        live1 = ctrl.get_live_status()['version']
+        ctrl.broadcaster.publish({'modes': dict(ctrl.modes)})
+        full2 = ctrl.get_status()['version']
+        self.assertGreater(live1, 0)
+        self.assertGreater(full2, live1)
 
 
 class TestAuthSecurity(unittest.TestCase):
@@ -1314,6 +1623,52 @@ class TestAppContextAsyncProbe(unittest.TestCase):
         ctx, fake_ctrl, runner, probe_mock = self._make()
         ctx.run('all', '-status')
         runner.assert_called_once_with('all', '-status')
+
+    def test_r7_corrupt_config_rewrite(self):
+        """R7: a corrupt device_config.json must self-heal — AppContext
+        falls back to defaults AND rewrites the file with valid content so
+        the next boot no longer reads the broken file. Uses the real
+        load_json/save_json against a real temp file (only heavy deps are
+        mocked)."""
+        runner = MagicMock(return_value=(True, '', ''))
+        fake_ctrl = MagicMock()
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        config_file = os.path.join(tmpdir.name, 'device_config.json')
+        for corrupt in ('{invalid', '[1, 2]', '"oops"'):
+            with self.subTest(corrupt=corrupt):
+                with open(config_file, 'w') as f:
+                    f.write(corrupt)
+                patchers = [
+                    patch.object(app_context_mod, 'make_cli_runner',
+                                 return_value=runner),
+                    patch.object(app_context_mod, 'AuthManager'),
+                    patch.object(app_context_mod, 'StatusBroadcaster'),
+                    patch.object(app_context_mod, 'detect_model',
+                                 return_value={}),
+                    patch.object(app_context_mod, 'PilotController',
+                                 return_value=fake_ctrl),
+                    patch.object(app_context_mod, 'probe_leds',
+                                 return_value=({}, '')),
+                    patch.object(app_context_mod, 'CONFIG_FILE', config_file),
+                ]
+                for p in patchers:
+                    p.start()
+                self.addCleanup(lambda: [p.stop() for p in patchers])
+                ctx = app_context_mod.AppContext()
+                self.assertTrue(self._wait_probe(ctx))
+                # File must have been rewritten with a valid config dict.
+                with open(config_file) as f:
+                    saved = json.load(f)
+                self.assertIsInstance(saved, dict)
+                self.assertEqual(saved['disk_count'],
+                                 ctx.default_disk_count)
+                self.assertTrue(saved['activity_blink'])
+                # Startup used the default config end to end.
+                self.assertEqual(ctx.cfg, saved)
+                self.assertTrue(ctx.initialized)
+                fake_ctrl.start_monitor.assert_called_once_with()
+                fake_ctrl.reset_mock()
 
 
 if __name__ == '__main__':

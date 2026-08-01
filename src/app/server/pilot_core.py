@@ -12,7 +12,7 @@ from uevent_watcher import UeventWatcher
 
 VALID_MODES = ['off', 'on', 'auto']
 VALID_EFFECTS = ['breath', 'manual-blink']
-# Effect priority matrix (F7, Todo 19): when several effect requests target
+# Effect priority matrix (F7): when several effect requests target
 # the same LED the highest-priority one wins.
 #   off > on > manual-blink > breath > activity-blink > chase
 #   - off:            mode-level, outranks every effect (checked first in _apply)
@@ -58,6 +58,7 @@ ACTIVITY_FAST_INTERVAL = 0.5
 ACTIVITY_SLOW_INTERVAL = 3.0
 HOTPLUG_FALLBACK_INTERVAL = 120.0
 SLEEP_WAKE_TIMEOUT = 3600.0
+IDENTIFY_DURATION = 10.0  # seconds — identify() blink self-expires (C4)
 
 WHITE = [255, 255, 255]
 NETDEV_ORANGE = [255, 165, 0]
@@ -305,10 +306,6 @@ def net_signature():
     return tuple(keys)
 
 
-def quick_hardware_signature():
-    return (disk_signature(), net_signature())
-
-
 def read_stats(path):
     try:
         with open(path) as f:
@@ -401,6 +398,7 @@ class PilotController:
         self._disk_sig = None
         self._net_sig = None
         self._last_applied = {}
+        self._last_blink_params = {}
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._wake_event = threading.Event()
@@ -409,6 +407,7 @@ class PilotController:
         self._rescan_count = 0
         self._settings_dirty = False
         self._settings_timer = None
+        self._settings_epoch = 0  # R6: bumped on stop so stale save timers skip
         self._last_hotplug_check = 0.0
         self._activity_idle_rounds = 0
         self.chase_enabled = False
@@ -417,6 +416,8 @@ class PilotController:
         self._chase_current = None
         self._chase_clock = time.monotonic  # injectable for tests
         self._chase_next_at = 0.0
+        self._identify_until = 0.0
+        self._identify_led = None
         self._uevent = UeventWatcher(self._on_uevent_hotplug)
 
     def _load_settings(self):
@@ -467,11 +468,18 @@ class PilotController:
         self._settings_dirty = True
         if self._settings_timer:
             self._settings_timer.cancel()
-        self._settings_timer = threading.Timer(SETTINGS_SAVE_DELAY, self._flush_settings)
+        # R6: the timer captures the current epoch; _flush_settings skips
+        # when it fires after stop_monitor bumped the epoch (old controller
+        # must not write stale settings over a rebuilt controller's file)
+        self._settings_timer = threading.Timer(
+            SETTINGS_SAVE_DELAY, self._flush_settings, args=(self._settings_epoch,))
         self._settings_timer.daemon = True
         self._settings_timer.start()
 
-    def _flush_settings(self):
+    def _flush_settings(self, epoch=None):
+        # R6: a timer from before the last stop (stale epoch) must not write
+        if epoch is not None and epoch != self._settings_epoch:
+            return
         with self._lock:
             if self._settings_dirty:
                 # additive-only: never drop top-level keys written by other
@@ -503,12 +511,9 @@ class PilotController:
             r, g, b = max(0, min(255, int(r))), max(0, min(255, int(g))), max(0, min(255, int(b)))
             self.settings.setdefault(led, {})['color'] = [r, g, b]
             self._schedule_settings_save()
-            mode = self.modes.get(led, 'off')
-            if mode != 'off':
-                ok, err = self._apply(led, mode, self.activity.get(led, False))
-                self._notify()
-                return ok, err
-            return True, 'OK'
+            # C6: keep a speed-aware blink's rhythm — reapply with the LED's
+            # last blink_params instead of collapsing to a transient solid-on
+            return self._apply_if_active(led, blink_params=self._last_blink_params.get(led))
 
     def set_brightness(self, led, brightness):
         with self._lock:
@@ -517,12 +522,8 @@ class PilotController:
             brightness = max(0, min(255, int(brightness)))
             self.settings.setdefault(led, {})['brightness'] = brightness
             self._schedule_settings_save()
-            mode = self.modes.get(led, 'off')
-            if mode != 'off':
-                ok, err = self._apply(led, mode, self.activity.get(led, False))
-                self._notify()
-                return ok, err
-            return True, 'OK'
+            # C6: see set_color — keep the active blink rhythm on brightness changes
+            return self._apply_if_active(led, blink_params=self._last_blink_params.get(led))
 
     def set_effect(self, led, effect, t_on=None, t_off=None):
         with self._lock:
@@ -535,7 +536,7 @@ class PilotController:
             else:
                 current = self.effects.get(led)
                 if current is not None and EFFECT_PRIORITY[effect] < EFFECT_PRIORITY[current]:
-                    # priority matrix (F7, Todo 19): never demote the active
+                    # priority matrix (F7): never demote the active
                     # effect with a lower-priority one (e.g. breath onto
                     # manual-blink). Same effect still updates its parameters.
                     return False, (f'Rejected {effect}: {current} has higher priority')
@@ -546,12 +547,8 @@ class PilotController:
                     self.settings.setdefault(led, {})['breath_t_on'] = max(0, int(t_on))
                 if t_off is not None:
                     self.settings.setdefault(led, {})['breath_t_off'] = max(0, int(t_off))
-            mode = self.modes.get(led, 'off')
-            if mode != 'off':
-                ok, err = self._apply(led, mode, self.activity.get(led, False))
-                self._notify()
-                return ok, err
-            return True, 'OK'
+            # C6: keep the active blink rhythm on effect changes
+            return self._apply_if_active(led, blink_params=self._last_blink_params.get(led))
 
     def identify(self, led):
         """Locate an LED by blinking it with its current color (F8, Todo 20).
@@ -573,6 +570,11 @@ class PilotController:
             if ok:
                 self._last_applied[led] = self._apply_key(
                     led, 'on', False, effect='manual-blink')
+                # C4: the identify blink self-expires — _monitor_loop
+                # restores the LED's mode once IDENTIFY_DURATION elapses
+                # (off/steady LEDs must not blink forever)
+                self._identify_until = time.monotonic() + IDENTIFY_DURATION
+                self._identify_led = led
             return ok, err or 'OK'
 
     def set_global_brightness(self, brightness):
@@ -583,10 +585,11 @@ class PilotController:
             self._schedule_settings_save()
             errors = []
             for led in self.leds:
-                if self.modes.get(led) != 'off':
-                    ok, err = self._apply(led, self.modes[led], self.activity.get(led, False))
-                    if not ok:
-                        errors.append(f'{led}: {err}')
+                # C6: keep each active LED's blink rhythm; single notify below
+                ok, err = self._apply_if_active(
+                    led, blink_params=self._last_blink_params.get(led), notify=False)
+                if not ok:
+                    errors.append(f'{led}: {err}')
             self._notify()
             return not errors, '; '.join(errors) if errors else 'OK'
 
@@ -648,7 +651,7 @@ class PilotController:
                     if self.activity.get(led):
                         self.activity[led] = False
                         if self.modes.get(led) == 'auto':
-                            # priority matrix (F7, Todo 19): reapply through
+                            # priority matrix (F7): reapply through
                             # _apply so user effects (manual-blink/breath) are
                             # kept — only the activity-blink state is reset
                             self._apply(led, 'auto', activity=False)
@@ -723,12 +726,19 @@ class PilotController:
 
     def _apply_key(self, led, mode, activity, effect=None, t_on=None, t_off=None,
                    blink_params=None):
+        # Dedup key contract (K2): the key must encode every input that
+        # changes the emitted CLI command — mode, activity, effect timing and
+        # presence (disk present / NIC carrier). presence must be part of the
+        # key: without it a pull/replug while idle produces the same key as
+        # the steady-on state and the dedup skips the -off/-on transition,
+        # leaving the LED lit / dark (H1).
         cfg = self.get_settings(led)
+        presence = self.presence.get(led, False)
         if effect == 'breath':
             return (mode, activity, effect, t_on, t_off,
-                    tuple(cfg['color']), cfg['brightness'])
+                    tuple(cfg['color']), cfg['brightness'], presence)
         return (mode, activity, effect, blink_params,
-                tuple(cfg['color']), cfg['brightness'])
+                tuple(cfg['color']), cfg['brightness'], presence)
 
     def restore_state(self, hardware_modes=None, apply_hardware=True):
         hardware_modes = hardware_modes or {}
@@ -775,7 +785,7 @@ class PilotController:
 
     def all_off(self):
         with self._lock:
-            # F2 (Todo 18): stop the chase demo first — otherwise the monitor
+            # F2: stop the chase demo first — otherwise the monitor
             # loop would keep stepping and re-light the LEDs after the batch off
             self._disable_chase()
             ok, _, err = self.run('all', '-off')
@@ -791,8 +801,20 @@ class PilotController:
             self._notify()
             return True, 'OK'
 
+    def _apply_if_active(self, led, blink_params=None, notify=True):
+        """M6: shared tail of set_color/set_brightness/set_effect/global
+        brightness — apply the LED's current mode when it is not 'off' and
+        notify. Returns (ok, err) with (True, 'OK') for inactive LEDs."""
+        mode = self.modes.get(led, 'off')
+        if mode == 'off':
+            return True, 'OK'
+        ok, err = self._apply(led, mode, self.activity.get(led, False), blink_params=blink_params)
+        if notify:
+            self._notify()
+        return ok, err
+
     def _apply(self, led, mode, activity=False, blink_params=None):
-        # priority matrix (F7, Todo 19): mode 'off' outranks every effect and
+        # priority matrix (F7): mode 'off' outranks every effect and
         # user effects (manual-blink/breath) outrank auto activity-blink —
         # both are enforced by the branch order below
         effect = self.effects.get(led)
@@ -844,16 +866,24 @@ class PilotController:
 
         if ok:
             self._last_applied[led] = key
+            if blink_params is not None:
+                # C6: remember the LED's blink rhythm so set_color/set_brightness/
+                # set_effect reapply it instead of flashing the LED solid-on;
+                # cleared when the LED's last apply was not a blink (steady-on)
+                self._last_blink_params[led] = blink_params
+            else:
+                self._last_blink_params.pop(led, None)
         return ok, err or 'OK'
 
     def _persist(self):
         save_json(self.state_file, dict(self.modes))
 
     def force_remap(self):
-        with self._lock:
-            self._on_hardware_changed()
-            self._notify()
-            return True, 'OK'
+        # R1: _on_hardware_changed takes the lock itself AFTER probing —
+        # do not hold the lock across the lsblk subprocess
+        self._on_hardware_changed()
+        self._notify()
+        return True, 'OK'
 
     def start_monitor(self):
         with self._lock:
@@ -862,6 +892,9 @@ class PilotController:
             self._net_ifaces = list_net_ifaces()
             self._refresh_signatures()
             self._update_presence()
+            # C5: seed the speed-blink clock so the first activity tick
+            # computes a real elapsed instead of a 0-elapsed steady-on flash
+            self._last_net_check = time.monotonic()
         print(f'DXP4800 Plus — Disks: {self._disk_map}, Network: {self._net_iface or "none"}')
         tier = self._monitor_tier()
         print(f'Monitor tier: {tier} (hotplug={"on" if self.needs_hotplug_monitor() else "off"})')
@@ -875,6 +908,8 @@ class PilotController:
         for slot, dev in self._disk_map.items():
             if disk_present(dev):
                 self._prev_disk_io[slot] = read_disk_io(f'/sys/block/{dev}/stat')
+                # C5: reseed the per-disk blink clock alongside the IO counter
+                self._last_disk_check[slot] = time.monotonic()
 
         self._sync_watchers()
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True, name='pilot-monitor')
@@ -884,41 +919,61 @@ class PilotController:
         self._stop.set()
         self._wake_monitor()
         self._uevent.stop()
+        # R6: invalidate pending settings-save timers (they captured the old
+        # epoch); the direct flush below still persists the current state
+        self._settings_epoch += 1
         if self._settings_timer:
             self._settings_timer.cancel()
         self._flush_settings()
 
     def _on_hardware_changed(self):
+        # R1: probe hardware OUTSIDE the lock — detect_disks spawns an lsblk
+        # subprocess (5s timeout); holding the lock across it would block
+        # every UI mutation (set_color/set_mode/...) while it hangs.
         old_map = dict(self._disk_map)
-        self._disk_map = detect_disks(self.ata_map, self._merged_hctl_map(), self.disk_count)
-        self._net_iface = detect_net_iface()
-        self._net_ifaces = list_net_ifaces()
-        self._update_presence()
-        self._rescan_count += 1
-        print(f'Hotplug remap #{self._rescan_count}: {old_map} -> {self._disk_map}, net={self._net_iface}')
+        disk_map = detect_disks(self.ata_map, self._merged_hctl_map(), self.disk_count)
+        net_iface = detect_net_iface()
+        net_ifaces = list_net_ifaces()
+        with self._lock:
+            self._disk_map = disk_map
+            self._net_iface = net_iface
+            self._net_ifaces = net_ifaces
+            self._update_presence()
+            self._rescan_count += 1
+            print(f'Hotplug remap #{self._rescan_count}: {old_map} -> {self._disk_map}, net={self._net_iface}')
 
-        for led in self.leds:
-            mode = self.modes.get(led, 'auto')
-            if mode in ('off', 'on'):
-                continue
-            if led.startswith('disk') and not self._is_present(led):
-                self._apply(led, 'auto', activity=False)
-                continue
-            if mode == 'auto':
-                # reapply via _apply: user effects (manual-blink/breath)
-                # outrank activity-blink and survive the remap (F7, Todo 19)
-                self._apply(led, 'auto', self.activity.get(led, False))
+            for led in self.leds:
+                mode = self.modes.get(led, 'auto')
+                if mode in ('off', 'on'):
+                    continue
+                if led.startswith('disk') and not self._is_present(led):
+                    self._apply(led, 'auto', activity=False)
+                    continue
+                if mode == 'auto':
+                    # reapply via _apply: user effects (manual-blink/breath)
+                    # outrank activity-blink and survive the remap (F7)
+                    self._apply(led, 'auto', self.activity.get(led, False))
 
-        for slot, dev in self._disk_map.items():
-            if disk_present(dev) and slot not in self._prev_disk_io:
-                self._prev_disk_io[slot] = read_disk_io(f'/sys/block/{dev}/stat')
+            for slot, dev in self._disk_map.items():
+                if disk_present(dev):
+                    if slot not in self._prev_disk_io:
+                        self._prev_disk_io[slot] = read_disk_io(f'/sys/block/{dev}/stat')
+                    # C5: hotplug resets the IO counter — reseed the blink clock
+                    # so speed-blink does not recompute from a stale elapsed window
+                    self._last_disk_check[slot] = time.monotonic()
 
-        self._prev_net_rx = {}
-        self._prev_net_tx = {}
-        for iface in self._net_ifaces:
-            base = f'/sys/class/net/{iface}/statistics'
-            self._prev_net_rx[iface] = read_stats(f'{base}/rx_bytes')
-            self._prev_net_tx[iface] = read_stats(f'{base}/tx_bytes')
+            self._prev_net_rx = {}
+            self._prev_net_tx = {}
+            # C5: reseed the net blink clock alongside the reset counters
+            self._last_net_check = time.monotonic()
+            for iface in self._net_ifaces:
+                base = f'/sys/class/net/{iface}/statistics'
+                self._prev_net_rx[iface] = read_stats(f'{base}/rx_bytes')
+                self._prev_net_tx[iface] = read_stats(f'{base}/tx_bytes')
+
+            # P1: refresh the fallback-scan signatures so _maybe_rescan sees
+            # the post-remap state and does not schedule a second full remap
+            self._refresh_signatures()
 
     def _maybe_rescan(self):
         if not self.needs_hotplug_monitor():
@@ -927,14 +982,18 @@ class PilotController:
         changed = False
         if self._needs_disk_hotplug():
             sig = disk_signature()
-            if sig != self._disk_sig:
-                self._disk_sig = sig
-                changed = True
+            # compare-and-set stays atomic under the lock; the probe itself
+            # (glob + file reads, no subprocess) runs lock-free (R1)
+            with self._lock:
+                if sig != self._disk_sig:
+                    self._disk_sig = sig
+                    changed = True
         if self._needs_net_hotplug():
             sig = net_signature()
-            if sig != self._net_sig:
-                self._net_sig = sig
-                changed = True
+            with self._lock:
+                if sig != self._net_sig:
+                    self._net_sig = sig
+                    changed = True
         if changed:
             self._on_hardware_changed()
             return True
@@ -967,8 +1026,21 @@ class PilotController:
             tier = self._monitor_tier()
             self._sync_watchers()
 
+            # C4: expire a pending identify blink and restore the LED's mode
+            if self._identify_until and time.monotonic() >= self._identify_until:
+                with self._lock:
+                    led, self._identify_led = self._identify_led, None
+                    self._identify_until = 0.0
+                    if led is not None:
+                        self._last_applied.pop(led, None)
+                        self._apply(led, self.modes.get(led, 'off'))
+
             if tier == 'sleep':
-                self._wake_event.wait(timeout=SLEEP_WAKE_TIMEOUT)
+                timeout = SLEEP_WAKE_TIMEOUT
+                if self._identify_until:
+                    # C4: don't sleep past a pending identify expiry
+                    timeout = min(timeout, self._identify_until - time.monotonic())
+                self._wake_event.wait(timeout=timeout)
                 self._wake_event.clear()
                 continue
 
@@ -977,26 +1049,34 @@ class PilotController:
             try:
                 if self._hotplug_pending.is_set():
                     self._hotplug_pending.clear()
-                    with self._lock:
-                        self._on_hardware_changed()
+                    # R1: _on_hardware_changed probes hardware outside the
+                    # lock — holding the lock across lsblk would block all UI
+                    self._on_hardware_changed()
                     notified = True
                 elif tier == 'hotplug':
                     now = time.monotonic()
                     if (now - self._last_hotplug_check) >= HOTPLUG_FALLBACK_INTERVAL:
                         self._last_hotplug_check = now
-                        with self._lock:
-                            if self._maybe_rescan():
-                                notified = True
+                        # R1: signature probes run lock-free; the compare-and-set
+                        # stays atomic inside _maybe_rescan
+                        if self._maybe_rescan():
+                            notified = True
                 else:
                     with self._lock:
-                        if self._check_network() or self._check_disks():
+                        # C3/M2: when activity blink is off (or no LED is in
+                        # auto mode) the IO checks must not run — traffic
+                        # would otherwise -blink an LED the user told to stay
+                        # put. _has_auto_activity_targets() gates them; the
+                        # chase demo below still steps.
+                        if self._has_auto_activity_targets() and (
+                                self._check_network() or self._check_disks()):
                             notified = True
                             self._activity_idle_rounds = 0
                             interval = ACTIVITY_FAST_INTERVAL
                         elif self.chase_enabled:
                             # chase demo: keep the fast cadence (no idle backoff)
                             # and step the lights unless live activity is showing
-                            # (activity-blink outranks the demo, Todo 19 matrix)
+                            # (activity-blink outranks the demo)
                             self._activity_idle_rounds = 0
                             if not self._any_led_active():
                                 if self._step_chase():
@@ -1024,16 +1104,41 @@ class PilotController:
             return (SPEED_BLINK_MID_ON_MS, SPEED_BLINK_MID_OFF_MS)
         return (SPEED_BLINK_FAST_ON_MS, SPEED_BLINK_FAST_OFF_MS)
 
+    def _apply_speed_blink(self, led, delta, elapsed):
+        """Map an activity rate (delta bytes over elapsed s) to blink params.
+
+        None when speed blink is off, the LED has a user effect, or the
+        window is zero (first tick) — shared by _check_network/_check_disks.
+        """
+        if not self.speed_blink_enabled or self.effects.get(led) is not None:
+            return None
+        if elapsed <= 0:
+            return None
+        return self._blink_for_rate(delta / elapsed)
+
     def _check_network(self):
         led = 'netdev'
         if self.modes.get(led) != 'auto':
             return False
+        # H2: a cable unplug is not a block-uevent, so _net_iface would stay
+        # stale until the next rescan — refresh NIC state every activity tick
+        self._net_ifaces = list_net_ifaces()
+        self._net_iface = detect_net_iface()
         if not self._net_iface:
+            # all NICs down -> the netdev LED must go dark even when already
+            # idle. Flip presence first so the dedup key changes and -off is
+            # not skipped (same mechanism as _check_disks, H1).
+            self.presence[led] = False
             if self.activity.get(led):
                 self.activity[led] = False
                 self._apply(led, 'auto', activity=False)
                 return True
+            key = self._apply_key(led, 'auto', False)
+            if self._last_applied.get(led) != key:
+                self._apply(led, 'auto', activity=False)
+                return True
             return False
+        self.presence[led] = True
         delta = 0
         for iface in self._net_ifaces:
             base = f'/sys/class/net/{iface}/statistics'
@@ -1044,13 +1149,10 @@ class PilotController:
             self._prev_net_rx[iface] = rx
             self._prev_net_tx[iface] = tx
         active = delta >= ACTIVITY_IO_THRESHOLD
-        blink_params = None
-        if self.speed_blink_enabled and self.effects.get(led) is None:
-            now = time.monotonic()
-            elapsed = (now - self._last_net_check) if self._last_net_check else 0.0
-            self._last_net_check = now
-            if elapsed > 0:
-                blink_params = self._blink_for_rate(delta / elapsed)
+        now = time.monotonic()
+        elapsed = (now - self._last_net_check) if self._last_net_check else 0.0
+        self._last_net_check = now
+        blink_params = self._apply_speed_blink(led, delta, elapsed)
         if active != self.activity.get(led):
             self.activity[led] = active
             self._apply(led, 'auto', activity=active, blink_params=blink_params)
@@ -1084,13 +1186,10 @@ class PilotController:
             delta = io - prev if io >= prev else 0
             active = delta >= ACTIVITY_IO_THRESHOLD
             self._prev_disk_io[slot] = io
-            blink_params = None
-            if self.speed_blink_enabled and self.effects.get(led) is None:
-                now = time.monotonic()
-                elapsed = now - self._last_disk_check.get(slot, now)
-                self._last_disk_check[slot] = now
-                if elapsed > 0:
-                    blink_params = self._blink_for_rate(delta / elapsed)
+            now = time.monotonic()
+            elapsed = now - self._last_disk_check.get(slot, now)
+            self._last_disk_check[slot] = now
+            blink_params = self._apply_speed_blink(led, delta, elapsed)
             if active != self.activity.get(led):
                 self.activity[led] = active
                 self._apply(led, 'auto', activity=active, blink_params=blink_params)
@@ -1119,6 +1218,7 @@ class PilotController:
                 'speed_blink': self.speed_blink_enabled,
                 'uevent_available': self._uevent.available,
                 'rescan_count': self._rescan_count,
+                'version': self.broadcaster.version,
             }
 
     def get_status(self):
@@ -1141,6 +1241,7 @@ class PilotController:
                 'uevent_available': self._uevent.available,
                 'rescan_count': self._rescan_count,
                 'model': DXP4800_PLUS_PROFILE,
+                'version': self.broadcaster.version,
             }
 
     def _notify(self):
