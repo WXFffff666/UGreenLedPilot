@@ -2,7 +2,8 @@
   'use strict';
 
   const LABELS = ['关闭', '常亮', '自动'];
-  // 效果选项：off/on/auto 走 /api/control 三态；breath/blink 走 /api/effect；chase 走 /api/chase（演示模式）
+  // 效果选项：off/on/auto 走 /api/control 三态；breath/blink 走 /api/effect；
+  // chase 为全局演示（/api/chase），仅由 fbar 的 btn-chase 切换，不在 per-LED 下拉中
   const EFFECT_LABELS = { off: '关闭', on: '常亮', breath: '呼吸', blink: '闪烁', chase: '跑马灯', auto: '自动' };
   let csrf = '';
   let modes = {};
@@ -10,8 +11,14 @@
   let leds = [];
   let presets = [];
   let eventSource = null;
-  // E15: led → 最近一次本地操作时间戳(ms)，SSE 合并 modes 时跳过保护窗内的盘位，避免旧帧回跳
-  let lastLocalTouch = {};
+  // R3: SSE 鉴权失败标志——置位后 onerror 不再重连，直接跳转登录页
+  let sseAuthFailed = false;
+  // M7: 状态单调版本水位——后端 StatusBroadcaster._version 单调递增，
+  // 随 /api/status 与 SSE 帧（get_live_status）下发。SSE 帧 version 旧于水位则整体丢弃，
+  // 取代原 E15 lastLocalTouch 1s 本地操作时间窗补偿（对缺失 version 的变通）。
+  let lastAppliedVersion = 0;
+  // K1: 全局跑马灯演示开关状态（后端 /api/status 未下发 chase_enabled，以本地 toggle 状态为准）
+  let chaseOn = false;
 
   function api(method, path, body) {
     const opts = {
@@ -78,24 +85,26 @@
   }
 
   function applyStatus(data, src) {
+    // M7: version 排序取代时间窗补偿——先做帧级去重，再应用任何状态
+    if (data.version !== undefined) {
+      if (src === 'sse') {
+        // SSE 帧 version 旧于最近已应用的状态 → 整帧丢弃，避免旧快照回跳
+        if (data.version < lastAppliedVersion) return;
+        lastAppliedVersion = data.version;
+      } else if (typeof data.version === 'number') {
+        // /api/status 快照：version 为单调计数器时推进水位，使后续旧 SSE 帧被丢弃。
+        // 注：http_handler._api_status 会把 version 覆写为 APP_VERSION 字符串
+        // （如 '2.2.0'）——非数字不可与 int 水位比较，故忽略；快照本身整体替换仍保证优先。
+        lastAppliedVersion = data.version;
+      }
+    }
     if (data.csrf_token) csrf = data.csrf_token;
     if (data.presets) presets = data.presets;
     if (data.settings) settings = data.settings;
     if (data.leds) leds = data.leds;
     if (data.modes) {
-      if (src === 'sse') {
-        // E15 保守策略：后端 get_live_status 无 version 字段（version 留给后端添加），
-        // 无法跨流排序，故 SSE 帧仅按盘位合并，且跳过用户 1s 内手动操作过的盘位，
-        // 避免旧的 SSE 快照覆盖新 status / 本地操作导致 modes 闪跳；窗口外旧帧风险可容忍。
-        const now = Date.now();
-        for (const led in data.modes) {
-          if (now - (lastLocalTouch[led] || 0) < 1000) continue;
-          modes[led] = data.modes[led];
-        }
-      } else {
-        // /api/status 完整快照，整体替换
-        modes = data.modes;
-      }
+      // M7: 帧级 version 排序已保证 data 不旧于已应用状态，整体替换即可（含 SSE）
+      modes = data.modes;
     }
 
     const netChip = document.getElementById('net-chip');
@@ -115,17 +124,21 @@
     if (ab && data.activity_blink !== undefined) ab.checked = !!data.activity_blink;
     const sb = document.getElementById('speed-blink');
     if (sb && data.speed_blink !== undefined) sb.checked = !!data.speed_blink;
-    // E15: 效果显示同步同样跳过本地操作保护窗内的盘位，避免下拉框被旧帧回跳
+    // M7: effects 与 modes 同帧同步——帧级 version 排序已去重，无需时间窗
     if (data.effects) {
-      const now = Date.now();
       for (const led in data.effects) {
-        if (src === 'sse' && now - (lastLocalTouch[led] || 0) < 1000) continue;
         const sel = document.getElementById('effect-' + led);
         if (sel && EFFECT_LABELS[data.effects[led]]) {
           sel.value = data.effects[led];
           sel.dataset.prev = data.effects[led];
         }
       }
+    }
+
+    // K1: 状态含 chase_enabled 时同步全局跑马灯按钮激活态
+    if (data.chase_enabled !== undefined) {
+      chaseOn = !!data.chase_enabled;
+      setChaseBtn(document.getElementById('btn-chase'), chaseOn);
     }
 
     if (data.presence) {
@@ -142,7 +155,6 @@
     api('POST', '/api/control', { led, action: next }).then((r) => {
       if (r.success) {
         updateUI(led, next);
-        lastLocalTouch[led] = Date.now();
         const m = led.match(/disk(\d+)/);
         const name = m ? '磁盘' + m[1] : led;
         toast(name + ' → ' + LABELS[(i + 1) % 3]);
@@ -155,11 +167,18 @@
       if (r.success) {
         leds.forEach((l) => {
           updateUI(l, m);
-          lastLocalTouch[l] = Date.now();
         });
         toast('已全部设为 ' + LABELS[['off', 'on', 'auto'].indexOf(m)]);
       } else toast(r.message, 'err');
     });
+  }
+
+  // K1: 全局跑马灯按钮激活态——开启时用主色（abtn.p）并标注 aria-pressed
+  function setChaseBtn(btn, on) {
+    if (!btn) return;
+    btn.className = 'abtn ' + (on ? 'p' : 'a');
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.title = on ? '跑马灯演示已开启，点击关闭' : '跑马灯演示：全局循环闪烁所有磁盘灯';
   }
 
   function renderPresets(container, led) {
@@ -207,7 +226,7 @@
         '<select class="effect" id="effect-' + led + '" data-led="' + led + '" aria-label="' + led + '效果">' +
         '<option value="off">关闭</option><option value="on">常亮</option>' +
         '<option value="breath">呼吸</option><option value="blink">闪烁</option>' +
-        '<option value="chase">跑马灯</option><option value="auto">自动</option></select>' +
+        '<option value="auto">自动</option></select>' +
         '<div class="tgl3" data-led="' + led + '"><div class="trk3"><div class="thm3"></div></div>' +
         '<span class="tlbl3"></span></div></div>';
       grid.appendChild(bay);
@@ -230,14 +249,7 @@
         const val = sel.value;
         const led = sel.dataset.led;
         let req;
-        if (val === 'chase') {
-          // 跑马灯为演示模式，需确认开启
-          if (!confirm('跑马灯为演示模式，将循环闪烁所有磁盘灯，继续？')) {
-            sel.value = sel.dataset.prev;
-            return;
-          }
-          req = api('POST', '/api/chase', { enabled: true });
-        } else if (val === 'breath' || val === 'blink') {
+        if (val === 'breath' || val === 'blink') {
           // 闪烁为手动闪烁效果，经 /api/effect 映射为 manual-blink
           req = api('POST', '/api/effect', { led, effect: val === 'blink' ? 'manual-blink' : 'breath' });
         } else {
@@ -248,7 +260,6 @@
           if (r.success) {
             sel.dataset.prev = val;
             updateUI(led, val);
-            lastLocalTouch[led] = Date.now();
             toast(led + ' → ' + (EFFECT_LABELS[val] || val));
           } else {
             sel.value = sel.dataset.prev;
@@ -308,6 +319,21 @@
     document.getElementById('btn-all-on').onclick = () => allMode('on');
     document.getElementById('btn-all-auto').onclick = () => allMode('auto');
     document.getElementById('btn-all-off').onclick = () => allMode('off');
+    // K1: 全局跑马灯演示开关（POST /api/chase 切换），与 per-LED 效果下拉分离
+    const btnChase = document.getElementById('btn-chase');
+    if (btnChase) {
+      setChaseBtn(btnChase, chaseOn);
+      btnChase.onclick = () => {
+        const enabled = !chaseOn;
+        api('POST', '/api/chase', { enabled }).then((r) => {
+          if (r.success) {
+            chaseOn = enabled;
+            setChaseBtn(btnChase, enabled);
+            toast(enabled ? '跑马灯演示已开启' : '跑马灯已关闭');
+          } else toast(r.message || '切换失败', 'err');
+        });
+      };
+    }
     document.getElementById('btn-save').onclick = () => api('POST', '/api/save', {}).then((r) => toast(r.success ? '已保存' : '失败', r.success ? 'ok' : 'err'));
     document.getElementById('btn-remap').onclick = () => api('POST', '/api/remap', {}).then((r) => toast(r.success ? '盘位已重映射' : '失败', r.success ? 'ok' : 'err'));
     document.getElementById('btn-logout').onclick = () => api('POST', '/api/logout', {}).then(() => { location.href = '/login'; });
@@ -377,14 +403,35 @@
     eventSource.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);
-        // E15: SSE payload 始终含 modes（get_live_status 快照），无需合并占位；
-        // 竞态由 applyStatus(src='sse') 内的本地操作保护窗处理
+        // R3: SSE 流中出现鉴权失败响应 → 置位标志并跳转登录，不再重连
+        if (data && data.success === false &&
+            (data.status === 401 || /请先登录/.test(data.message || ''))) {
+          sseAuthFailed = true;
+          eventSource.close();
+          location.href = '/login';
+          return;
+        }
+        // M7: SSE payload 始终含 modes + version（get_live_status 快照）；
+        // 旧帧回跳竞态由 applyStatus(src='sse') 内的 version 水位处理
         applyStatus(data, 'sse');
       } catch (_) { /* ignore */ }
     };
     eventSource.onerror = () => {
       eventSource.close();
-      setTimeout(connectSSE, 3000);
+      // R3: 已确认鉴权失败则直接跳转，停止重连
+      if (sseAuthFailed) { location.href = '/login'; return; }
+      // R3: 重连前探测会话有效性——若返回 401（登录过期/未授权）则终止重连循环并跳转登录；
+      // 网络抖动等临时错误仍按原 3s 重连
+      fetch('/api/status', { headers: { 'X-Requested-With': 'UGreenLedPilot' } })
+        .then((r) => {
+          if (r.status === 401) {
+            sseAuthFailed = true;
+            location.href = '/login';
+            return;
+          }
+          setTimeout(connectSSE, 3000);
+        })
+        .catch(() => setTimeout(connectSSE, 3000));
     };
   }
 

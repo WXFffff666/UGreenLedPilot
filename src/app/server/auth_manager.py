@@ -1,36 +1,17 @@
 """Administrator authentication for UGreenLedPilot."""
 
 import hashlib
-import json
 import os
 import secrets
 import time
+
+from utils import load_json, save_json
 
 SESSION_MAX_AGE = 86400 * 7  # 7 days
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_SECONDS = 900  # 15 minutes
 PBKDF2_ITERATIONS = 200000
 DEFAULT_USERNAME = 'admin'
-
-
-def load_json(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return default
-
-
-def save_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
 
 
 class AuthManager:
@@ -48,8 +29,10 @@ class AuthManager:
             self.cfg['must_change_password'] = True
             self.save()
         elif 'password' in self.cfg and 'password_hash' not in self.cfg:
-            self.set_password(self.cfg['password'])
+            plain = self.cfg['password']
             del self.cfg['password']
+            self.cfg['must_change_password'] = True
+            self.set_password(plain)
 
     def _hash(self, password, salt=None):
         salt = salt or secrets.token_hex(16)
@@ -186,3 +169,7 @@ class AuthManager:
 
     def save(self):
         save_json(self.auth_file, self.cfg)
+        try:
+            os.chmod(self.auth_file, 0o600)
+        except OSError:
+            pass

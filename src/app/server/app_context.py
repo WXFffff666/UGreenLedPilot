@@ -12,7 +12,7 @@ from pilot_core import (
 )
 from utils import load_json, save_json
 
-APP_VERSION = '2.2.0'
+APP_VERSION = '2.2.1'
 
 _BUNDLED = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ugreen_leds_cli')
 CLI = _BUNDLED if os.path.exists(_BUNDLED) else '/usr/local/bin/ugreen_leds_cli'
@@ -48,8 +48,16 @@ class AppContext:
                          daemon=True).start()
         self.initialized = os.path.exists(CONFIG_FILE)
         self.default_disk_count = DXP4800_PLUS_PROFILE['disk_count']
-        self.cfg = load_json(CONFIG_FILE, self._default_config())
-        if not self.initialized:
+        default_cfg = self._default_config()
+        self.cfg = load_json(CONFIG_FILE, default_cfg)
+        if not isinstance(self.cfg, dict) or (
+                self.initialized and self.cfg == default_cfg):
+            # device_config.json is corrupt (not an object) or unparseable
+            # (load_json fell back to the default): rewrite the file from
+            # defaults so the next boot reads valid content (self-heal).
+            self.cfg = default_cfg
+            save_json(CONFIG_FILE, self.cfg)
+        elif not self.initialized:
             save_json(CONFIG_FILE, self.cfg)
             self.initialized = True
         self.disk_count = self.cfg['disk_count']
