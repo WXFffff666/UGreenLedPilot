@@ -28,6 +28,36 @@ def validate_mode(mode):
     return mode in VALID_MODES
 
 
+def _origin_identity(url):
+    """Extract (scheme, hostname, port) from an Origin/Referer/Host URL.
+
+    Returns None when the host is missing or the port segment is not
+    numeric, so crafted values like ``http://127.0.0.1:19580.evil.com``
+    (whose parsed hostname would be ``127.0.0.1``) are rejected.
+
+    Default ports are normalized so that ``http://host/`` equals
+    ``host:80``: port 80 is dropped for http (and for scheme-less Host
+    headers), port 443 for https.
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return None
+        port = parsed.port  # raises ValueError when port segment is non-numeric
+        scheme = parsed.scheme.lower()
+        if port is not None:
+            if scheme == 'http' and port == 80:
+                port = None
+            elif scheme == 'https' and port == 443:
+                port = None
+            elif scheme == '' and port in (80, 443):
+                port = None
+        return (scheme, hostname.lower(), port)
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 def _header_host(url):
     """Extract lowercase hostname from an Origin/Referer URL, or None if invalid.
 
@@ -35,15 +65,8 @@ def _header_host(url):
     numeric, so that crafted values like ``http://127.0.0.1:19580.evil.com``
     (whose parsed hostname would be ``127.0.0.1``) are rejected.
     """
-    try:
-        parsed = urlparse(url)
-        hostname = parsed.hostname
-        if not hostname:
-            return None
-        parsed.port  # raises ValueError when port segment is non-numeric
-        return hostname.lower()
-    except (ValueError, TypeError, AttributeError):
-        return None
+    identity = _origin_identity(url)
+    return identity[1] if identity else None
 
 
 class PilotHandler(BaseHTTPRequestHandler):
@@ -70,12 +93,20 @@ class PilotHandler(BaseHTTPRequestHandler):
         host = self.headers.get('Host', '')
         if not origin and not referer:
             return True
-        try:
-            host_name = (urlparse('//' + host).hostname or '').lower()
-        except (ValueError, TypeError, AttributeError):
-            host_name = ''
+        host_ident = _origin_identity('//' + host)
+        if host_ident is None:
+            return False
+        host_scheme, host_name, host_port = host_ident
         for candidate in (origin, referer):
-            if candidate and _header_host(candidate) != host_name:
+            if not candidate:
+                continue
+            cand = _origin_identity(candidate)
+            if cand is None:
+                return False
+            cand_scheme, cand_name, cand_port = cand
+            if (host_name, host_port) != (cand_name, cand_port):
+                return False
+            if host_scheme and cand_scheme and host_scheme != cand_scheme:
                 return False
         return True
 
@@ -123,6 +154,8 @@ class PilotHandler(BaseHTTPRequestHandler):
             return self._json(403, {'success': False, 'message': '来源校验失败'})
 
         body = self._body()
+        if body is None:
+            return
         try:
             data = json.loads(body) if body else {}
         except json.JSONDecodeError:
@@ -141,7 +174,7 @@ class PilotHandler(BaseHTTPRequestHandler):
             '/api/color': lambda: self._color(data),
             '/api/preset': lambda: self._preset(data),
             '/api/brightness': lambda: self._brightness(data),
-            '/api/save': lambda: (self.app.ctrl._persist(), self._json(200, {'success': True}))[1],
+            '/api/save': self._save_settings,
             '/api/change-password': lambda: self._change_password(data),
             '/api/remap': self._remap,
             '/api/activity-blink': lambda: self._activity_blink(data),
@@ -309,7 +342,7 @@ class PilotHandler(BaseHTTPRequestHandler):
         return self._json(200 if ok else 500, {'success': ok, 'message': msg})
 
     def _effect(self, data):
-        """F1 (Todo 16): set/clear a per-LED effect (breath / manual-blink).
+        """Set/clear a per-LED effect (breath / manual-blink).
 
         effect = 'off' / null / missing clears the effect; 'blink' is the
         UI name mapped to backend 'manual-blink' (both are accepted).
@@ -335,14 +368,14 @@ class PilotHandler(BaseHTTPRequestHandler):
         return self._json(200 if ok else 500, {'success': ok, 'message': msg})
 
     def _chase(self, data):
-        """F1 (Todo 17): toggle the chase demo (running light)."""
-        enabled = data.get('enabled', True) is not False
+        """Toggle the chase demo (running light)."""
+        enabled = bool(data.get('enabled', True))
         ok, msg = self.app.ctrl.set_chase(enabled)
         return self._json(200 if ok else 500, {'success': ok, 'message': msg})
 
     def _speed_blink(self, data):
-        """F1 (Todo 17): toggle rate-aware blink, persisted to device_config."""
-        enabled = data.get('enabled', True) is not False
+        """Toggle rate-aware blink, persisted to device_config."""
+        enabled = bool(data.get('enabled', True))
         ok, msg = self.app.ctrl.set_speed_blink(enabled)
         self.app.cfg['speed_blink'] = enabled
         save_json(CONFIG_FILE, self.app.cfg)
@@ -356,7 +389,7 @@ class PilotHandler(BaseHTTPRequestHandler):
         })
 
     def _calibrate_identify(self, data):
-        """F8 (Todo 20): blink the given LED so the user can locate the bay.
+        """Blink the given LED so the user can locate the bay.
 
         Delegates to ctrl.identify() — the blink runs inside the controller
         lock (F2 finding 4), never a raw run() call from the handler.
@@ -370,7 +403,7 @@ class PilotHandler(BaseHTTPRequestHandler):
         return self._json(200, {'success': True, 'message': '识别中'})
 
     def _calibrate_bind(self, data):
-        """F8 (Todo 20): persist a manual slot -> hctl bay binding."""
+        """Persist a manual slot -> hctl bay binding."""
         slot, hctl = data.get('slot', ''), data.get('hctl', '')
         if isinstance(slot, str) and slot.startswith('disk'):
             try:
@@ -401,6 +434,11 @@ class PilotHandler(BaseHTTPRequestHandler):
         self.app.reset_controller()
         return self._json(200, {'success': True})
 
+    def _save_settings(self):
+        self.app.ctrl._flush_settings()
+        self.app.ctrl._persist()
+        return self._json(200, {'success': True})
+
     def _change_password(self, data):
         ok, msg = self.app.auth.change_password(data.get('old_password', ''), data.get('new_password', ''))
         if ok:
@@ -418,22 +456,37 @@ class PilotHandler(BaseHTTPRequestHandler):
         with open(full, 'rb') as f:
             data = f.read()
         self.send_response(200)
+        self._send_security_headers()
         if rel_path.endswith('.html'):
             self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self._send_security_headers()
         else:
             self.send_header('Content-Type', ctype)
             if rel_path.endswith(('.css', '.js')):
                 self.send_header('Cache-Control', 'public, max-age=3600')
-            else:
-                self._send_security_headers()
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
     def _body(self):
-        n = int(self.headers.get('Content-Length', 0))
+        """Read and validate the request body.
+
+        Returns the body ('' when absent), or None after sending a 400/413
+        error response for a malformed or oversized Content-Length.
+        """
+        raw = self.headers.get('Content-Length', 0)
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            self._json(400, {'success': False, 'message': 'Invalid Content-Length'})
+            return None
+        if n < 0:
+            self._json(400, {'success': False, 'message': 'Invalid Content-Length'})
+            return None
         if n > MAX_BODY_BYTES:
-            raise ValueError('Request body too large')
+            self._json(413, {'success': False, 'message': 'Request body too large'})
+            return None
         return self.rfile.read(n) if n else ''
 
     def _json(self, status, data):
@@ -441,7 +494,10 @@ class PilotHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self._send_security_headers()
         self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
+        try:
+            self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
     def log_message(self, *args):
         pass

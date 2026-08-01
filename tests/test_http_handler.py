@@ -227,6 +227,35 @@ class TestOriginCheck(_HandlerMixin, unittest.TestCase):
         handler = self.make_handler(headers={'Host': '127.0.0.1:19580'})
         self.assertTrue(handler._check_origin())
 
+    def test_s1_origin_port_mismatch(self):
+        # S1: same hostname, different port -> the origins are different
+        handler = self.make_handler(headers={
+            'Host': '127.0.0.1:19580', 'Origin': 'http://127.0.0.1:9999'})
+        self.assertFalse(handler._check_origin())
+        handler = self.make_handler(headers={
+            'Host': '127.0.0.1:19580',
+            'Referer': 'http://127.0.0.1:9999/index.html'})
+        self.assertFalse(handler._check_origin())
+
+    def test_s1_origin_host_port_match(self):
+        # S1: same scheme + hostname + port -> accepted
+        handler = self.make_handler(headers={
+            'Host': '127.0.0.1:19580', 'Origin': 'http://127.0.0.1:19580'})
+        self.assertTrue(handler._check_origin())
+        handler = self.make_handler(headers={
+            'Host': '127.0.0.1:19580',
+            'Referer': 'http://127.0.0.1:19580/index.html'})
+        self.assertTrue(handler._check_origin())
+
+    def test_s1_default_port_normalization(self):
+        # S1: http://host/ (default port 80) must equal a Host of host:80
+        handler = self.make_handler(headers={
+            'Host': '127.0.0.1:80', 'Origin': 'http://127.0.0.1'})
+        self.assertTrue(handler._check_origin())
+        handler = self.make_handler(headers={
+            'Host': '127.0.0.1', 'Origin': 'http://127.0.0.1:80'})
+        self.assertTrue(handler._check_origin())
+
     def test_evil_origin_suffix_rejected(self):
         handler = self.make_handler(headers={
             'Host': '127.0.0.1:19580',
@@ -360,7 +389,8 @@ class TestStaticServing(_HandlerMixin, unittest.TestCase):
         self.assertEqual(self.content_type_headers(handler), ['text/css'])
         cache = [c.args[1] for c in handler.send_header.call_args_list
                  if c.args[0] == 'Cache-Control']
-        self.assertEqual(cache, ['public, max-age=3600'])
+        self.assertEqual(cache[-1], 'public, max-age=3600')
+        self.assertIn('no-store', cache)
         data = handler.wfile.write.call_args[0][0]
         self.assertGreater(len(data), 0)
 
@@ -377,13 +407,64 @@ class TestStaticServing(_HandlerMixin, unittest.TestCase):
         handler.do_GET()
         self.assertEqual(handler._responses[-1][0], 404)
 
+    def test_r4_static_headers(self):
+        # css / js / binary resources must all carry the security headers
+        for name, content in (('app.css', b'a{}'), ('app.js', b'x=1'),
+                              ('favicon.ico', b'\x00\x01\x02')):
+            with open(os.path.join(self.dir, name), 'wb') as f:
+                f.write(content)
+        with patch('http_handler.WWW_DIR', self.dir):
+            for name in ('app.css', 'app.js', 'favicon.ico'):
+                handler = self.make_handler(path=f'/static/{name}')
+                handler.do_GET()
+                handler.send_response.assert_called_once_with(200)
+                sent = {c.args[0]: c.args[1]
+                        for c in handler.send_header.call_args_list}
+                for sec in ('X-Content-Type-Options', 'X-Frame-Options',
+                            'Referrer-Policy', 'X-Robots-Tag',
+                            'Content-Security-Policy'):
+                    self.assertIn(sec, sent, f'{name} missing {sec}')
+
+    def test_static_broken_pipe_safe(self):
+        handler = self.make_handler(path='/static/app.css')
+        handler.wfile.write.side_effect = BrokenPipeError()
+        handler.do_GET()  # must not raise
+
 
 class TestRequestBody(_HandlerMixin, unittest.TestCase):
-    def test_oversized_body_raises(self):
+    """S2: Content-Length guarded — oversized 413, malformed 400, no crash."""
+
+    def test_s2_oversized_body_413(self):
         handler = self.make_handler(headers={
             'Content-Length': str(MAX_BODY_BYTES + 1)})
-        with self.assertRaises(ValueError):
-            handler._body()
+        self.assertIsNone(handler._body())
+        status, body = handler._responses[-1]
+        self.assertEqual(status, 413)
+        self.assertFalse(body['success'])
+        handler.rfile.read.assert_not_called()
+
+    def test_s2_bad_content_length_400(self):
+        for bad in ('abc', '-5', '1.5'):
+            handler = self.make_handler(headers={'Content-Length': bad})
+            self.assertIsNone(handler._body())
+            status, body = handler._responses[-1]
+            self.assertEqual(status, 400)
+            self.assertFalse(body['success'])
+
+    def test_post_bad_content_length_400(self):
+        headers = self.auth_headers()
+        headers['Content-Length'] = 'not-a-number'
+        handler = self.make_handler(path='/api/color', headers=headers)
+        handler.do_POST()
+        status, body = handler._responses[-1]
+        self.assertEqual(status, 400)
+        self.ctrl.set_color.assert_not_called()
+
+    def test_json_broken_pipe_safe(self):
+        handler = self.make_handler()
+        handler._json = lambda status, data: PilotHandler._json(handler, status, data)
+        handler.wfile.write.side_effect = BrokenPipeError()
+        handler._json(200, {'success': True})  # must not raise
 
     def test_body_reads_exact_length(self):
         handler = self.make_handler(headers={'Content-Length': '5'})
@@ -399,6 +480,51 @@ class TestRequestBody(_HandlerMixin, unittest.TestCase):
         handler = self.make_handler(path='/api/nope', headers=self.auth_headers())
         self.post_json(handler, {})
         self.assertEqual(handler._responses[-1][0], 404)
+
+
+class TestBoolCoercion(_HandlerMixin, unittest.TestCase):
+    """S5: all enabled-toggle handlers coerce with bool() — 0/1 both work."""
+
+    def setUp(self):
+        super().setUp()
+        self.ctrl.set_activity_blink.return_value = (True, 'OK')
+        self.ctrl.set_chase.return_value = (True, 'OK')
+        self.ctrl.set_speed_blink.return_value = (True, 'OK')
+
+    def test_s5_bool_coercion(self):
+        # {enabled: 0} must mean False in every handler
+        cfg_path = os.path.join(self.dir, 'device_config.json')
+        with patch('app_context.CONFIG_FILE', cfg_path):
+            handler = self.make_handler(
+                path='/api/activity-blink', headers=self.auth_headers())
+            handler.app.cfg = {'activity_blink': True}
+            self.post_json(handler, {'enabled': 0})
+            self.assertEqual(handler._responses[-1][0], 200)
+            self.ctrl.set_activity_blink.assert_called_once_with(False)
+        with patch('http_handler.CONFIG_FILE', cfg_path):
+            handler = self.make_handler(
+                path='/api/speed-blink', headers=self.auth_headers())
+            handler.app.cfg = {'activity_blink': True}
+            self.post_json(handler, {'enabled': 0})
+            self.assertEqual(handler._responses[-1][0], 200)
+            self.ctrl.set_speed_blink.assert_called_once_with(False)
+        handler = self.make_handler(path='/api/chase', headers=self.auth_headers())
+        self.post_json(handler, {'enabled': 0})
+        self.assertEqual(handler._responses[-1][0], 200)
+        self.ctrl.set_chase.assert_called_once_with(False)
+
+
+class TestSave(_HandlerMixin, unittest.TestCase):
+    """M4: POST /api/save flushes pending settings and persists state."""
+
+    def test_m4_save_flushes(self):
+        handler = self.make_handler(path='/api/save', headers=self.auth_headers())
+        self.post_json(handler, {})
+        status, body = handler._responses[-1]
+        self.assertEqual(status, 200)
+        self.assertTrue(body['success'])
+        self.ctrl._flush_settings.assert_called_once_with()
+        self.ctrl._persist.assert_called_once_with()
 
 
 class TestCalibrate(_HandlerMixin, unittest.TestCase):
@@ -719,6 +845,50 @@ class TestEffectRoutes(_HandlerMixin, unittest.TestCase):
         ok, err = ctrl.identify('disk9')
         self.assertFalse(ok)
         self.assertIn('disk9', err)
+
+
+class TestAuthMigrationPerms(unittest.TestCase):
+    """S4/M11: legacy plaintext migration must force a password change,
+    and the auth file must keep 0600 on every save."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def _write_legacy(self, name='legacy.json', password='hunter22'):
+        path = os.path.join(self.dir, name)
+        with open(path, 'w') as f:
+            json.dump({'username': 'admin', 'password': password}, f)
+        return path
+
+    def test_legacy_plaintext_migration_sets_must_change_password(self):
+        path = self._write_legacy()
+        am = AuthManager(path)
+        self.assertTrue(am.must_change_password())
+        # plaintext must be gone from memory and from disk
+        self.assertNotIn('password', am.cfg)
+        with open(path) as f:
+            self.assertNotIn('password', json.load(f))
+        # migrated hash still verifies against the old plaintext
+        self.assertTrue(am.verify_password('hunter22'))
+
+    def test_legacy_migration_change_password_clears_flag(self):
+        path = self._write_legacy()
+        am = AuthManager(path)
+        ok, _ = am.change_password('hunter22', 'newpassword1')
+        self.assertTrue(ok)
+        self.assertFalse(am.must_change_password())
+
+    def test_auth_file_keeps_0600(self):
+        path = os.path.join(self.dir, 'auth.json')
+        am = AuthManager(path)
+        with patch('auth_manager.os.chmod') as chmod:
+            am.create_session()
+            am.change_password('admin123', 'newpassword1')
+            am.logout()
+        chmod.assert_called_with(path, 0o600)
+        if os.name != 'nt':
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
 
 
 if __name__ == '__main__':
