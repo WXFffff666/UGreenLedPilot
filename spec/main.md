@@ -6,7 +6,7 @@ UGreenLedPilot is a native fnOS application for **UGREEN DXP4800 Plus** LED cont
 
 All hardware access goes through `ugreen_leds_cli` from [miskcoo/ugreen_leds_controller](https://github.com/miskcoo/ugreen_leds_controller). No kernel module or alternate driver path is used at runtime.
 
-**Current version:** 2.2.1
+**Current version:** 2.3.0
 
 ## Project History
 
@@ -17,6 +17,8 @@ All hardware access goes through `ugreen_leds_cli` from [miskcoo/ugreen_leds_con
 | v2.0.0 | Modular architecture; SSE; CLI dedup; separate `www` frontend |
 | v2.1.0 | netlink uevent hotplug; tiered monitor sleep; activity-blink toggle; glassmorphism UI |
 | v2.2.0 | effect modes (breath/manual-blink/chase); speed-aware blink; single-user auth; multi-NIC activity; bay calibration; perf & reliability fixes |
+| v2.3.0 | night-schedule auto-dim; disk/net failure alerts; forced first-login password change; iframe desktop window; version alignment |
+| v2.2.2 | packaging: store acceptance — platform=x86, os_min_version, wizard normalization, CI auto-release |
 | v2.2.1 | bugfix: hotplug-off fixes (H1 unplug-off dedup, H2 NIC port off); chase gating & identify timeout; security hardening (origin/body); settings timer race; perf dual-map |
 
 ## Architecture
@@ -76,6 +78,8 @@ Authenticated POST routes require session cookie + `X-CSRF-Token`.
 | POST | `/api/all/{off\|on\|auto}` | — | Batch mode |
 | POST | `/api/remap` | — | Force disk remap |
 | POST | `/api/change-password` | `{old_password, new_password}` | Change admin password |
+| POST | `/api/night-schedule` | `{enabled, start_hour, end_hour, night_brightness}` | Set night auto-dim window |
+| POST | `/api/alerts` | `{enabled, disk_failure, network_down}` | Configure failure alerts |
 | POST | `/api/reset` | — | Clear config and state |
 
 LED names: `power`, `netdev`, `disk1`–`disk4`.
@@ -114,7 +118,7 @@ UGreenLedPilot/
 | Field | Value |
 |-------|-------|
 | `appname` | UGreenLedPilot |
-| `version` | 2.2.1 |
+| `version` | 2.3.0 |
 | `service_port` | 19580 |
 | `arch` | x86_64 |
 

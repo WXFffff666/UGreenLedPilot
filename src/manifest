@@ -1,6 +1,6 @@
 appname               = UGreenLedPilot
 
-version               = 2.2.2
+version               = 2.3.0
 
 display_name          = UGreen LED Pilot
 
@@ -22,5 +22,5 @@ desktop_applaunchname = UGreenLedPilot.Application
 
 service_port          = 19580
 
-changelog             = v2.2.2: 修复应用中心/安全中心拒绝安装（"应用包格式不符合系统版本要求"）——manifest 弃用 arch 改用 platform=x86、补充 os_min_version、wizard 引导文件规范化。CLI pin 上游 af2b7ae 不变。
+changelog             = v2.3.0: 定时策略（夜间窗口自动调暗/关闭，白天自动恢复）；磁盘消失/网络断开红色闪烁告警 + UI 横幅；首次登录强制修改默认密码；fnOS 桌面 iframe 嵌入式窗口；版本号与发布对齐。
 

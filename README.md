@@ -4,7 +4,7 @@
 
 基于 [miskcoo/ugreen_leds_controller](https://github.com/miskcoo/ugreen_leds_controller) 的 `ugreen_leds_cli` 驱动，所有硬件操作均通过该 CLI 完成，无其他控制路径。
 
-**当前版本：v2.2.1** · [下载 Release](https://github.com/WXFffff666/UGreenLedPilot/releases/tag/v2.2.1)
+**当前版本：v2.3.0** · [下载 Release](https://github.com/WXFffff666/UGreenLedPilot/releases/tag/v2.3.0)
 
 ---
 
@@ -26,6 +26,10 @@
 | 速度感知闪烁 | 自动模式闪烁随磁盘/网络活动速度自适应 |
 | 多网口活动 | 聚合多个物理网口活动（过滤虚拟网卡） |
 | 盘位校准 | 逐灯识别 + 手动绑定盘位（UI 入口） |
+| 定时策略 | 夜间窗口自动调暗/关闭 LED，白天自动恢复 |
+| 故障告警 | 磁盘消失 / 网络断开 → 红色闪烁告警 + UI 横幅 |
+| 嵌入式窗口 | fnOS 桌面 iframe 内嵌打开，无需新开浏览器标签页 |
+| 首次登录引导 | 默认密码首次登录强制修改 |
 | 安全鉴权 | 单用户登录、CSRF、限流、PBKDF2 密码哈希 |
 
 ---
@@ -95,7 +99,7 @@ src/app/server/
 
 ## 安装
 
-1. 从 [Releases](https://github.com/WXFffff666/UGreenLedPilot/releases) 下载 `UGreenLedPilot-2.2.1.x86_64.fpk`
+1. 从 [Releases](https://github.com/WXFffff666/UGreenLedPilot/releases) 下载 `UGreenLedPilot-2.3.0.x86_64.fpk`
 2. 飞牛应用中心 → 手动安装
 3. 打开应用，默认密码 `admin123`（**请立即修改**，至少 8 位，最长 128 位）
 
@@ -164,6 +168,8 @@ src/app/server/
 
 | 版本 | 要点 |
 |------|------|
+| **v2.3.0** | 定时策略（夜间自动调暗/关闭）；磁盘/断网红色告警 + UI 横幅；首次登录强制改密；fnOS 桌面 iframe 嵌入式窗口；版本号对齐 |
+| **v2.2.2** | 修复应用中心/安全中心拒绝安装——manifest 弃用 arch 改用 platform=x86、补充 os_min_version、wizard 引导文件规范化；CI 自动打包 + Release 工作流 |
 | **v2.2.1** | bugfix：热插拔修复（H1 拔盘灭、H2 网口灭灯）；chase 门控与 identify 超时；安全加固（origin/body）；设置定时器竞态；性能双重映射 |
 | **v2.2.0** | 效果模式（呼吸/手动闪烁/跑马灯演示）；速度感知闪烁；单用户鉴权；多网口活动聚合；盘位校准；性能优化与可靠性修复；玻璃拟态 UI 美化 |
 | **v2.1.0** | netlink uevent 零轮询热插拔；分层监控休眠；活动闪烁可关；玻璃拟态 UI |
