@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AppDir = Join-Path $ProjectDir 'src'
 $BuildDir = Join-Path $ProjectDir 'build'
-$FnpackUrl = 'https://static2.fnnas.com/fnpack/fnpack-1.2.1-windows-amd64'
+$FnpackUrl = 'https://static2.fnnas.com/fnpack/fnpack-1.2.3-windows-amd64'
 $FnpackBin = Join-Path $ProjectDir 'fnpack.exe'
 
 Write-Host '========================================='
