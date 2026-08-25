@@ -78,13 +78,19 @@ class PilotHandler(BaseHTTPRequestHandler):
 
     def _send_security_headers(self):
         self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('X-Frame-Options', 'SAMEORIGIN')
         self.send_header('Referrer-Policy', 'strict-origin-when-cross-origin')
         self.send_header('X-Robots-Tag', 'noindex, nofollow')
         self.send_header('Cache-Control', 'no-store')
+        # fnOS desktop embeds the app in a cross-origin iframe (desktop on
+        # port 5666/5667 vs this app's service port). X-Frame-Options:
+        # SAMEORIGIN would block that framing, so it is intentionally NOT
+        # set; CSP frame-ancestors is its modern successor and allows the
+        # desktop origin (scheme-sources, since the desktop port is non-default).
         self.send_header(
             'Content-Security-Policy',
-            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'",
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; connect-src 'self'; "
+            "frame-ancestors 'self' http: https:",
         )
 
     def _check_origin(self):
@@ -181,6 +187,8 @@ class PilotHandler(BaseHTTPRequestHandler):
             '/api/effect': lambda: self._effect(data),
             '/api/chase': lambda: self._chase(data),
             '/api/speed-blink': lambda: self._speed_blink(data),
+            '/api/night-schedule': lambda: self._night_schedule(data),
+            '/api/alerts': lambda: self._alerts(data),
             '/api/calibrate/identify': lambda: self._calibrate_identify(data),
             '/api/calibrate/bind': lambda: self._calibrate_bind(data),
             '/api/all/off': lambda: self._all('off'),
@@ -380,6 +388,32 @@ class PilotHandler(BaseHTTPRequestHandler):
         self.app.cfg['speed_blink'] = enabled
         save_json(CONFIG_FILE, self.app.cfg)
         return self._json(200 if ok else 500, {'success': ok, 'message': msg})
+
+    def _night_schedule(self, data):
+        """Set the night auto-dim schedule, persisted to device_config."""
+        ok, msg = self.app.ctrl.set_night_schedule(data)
+        if not ok:
+            return self._json(400, {'success': False, 'message': msg})
+        self.app.cfg['night_schedule'] = dict(self.app.ctrl.night_schedule)
+        save_json(CONFIG_FILE, self.app.cfg)
+        return self._json(200, {
+            'success': True, 'message': msg,
+            'schedule': dict(self.app.ctrl.night_schedule),
+            'night_active': self.app.ctrl.night_active,
+        })
+
+    def _alerts(self, data):
+        """Configure failure alerts, persisted to device_config."""
+        ok, msg = self.app.ctrl.set_alert_config(data)
+        if not ok:
+            return self._json(400, {'success': False, 'message': msg})
+        self.app.cfg['alerts'] = dict(self.app.ctrl.alert_cfg)
+        save_json(CONFIG_FILE, self.app.cfg)
+        return self._json(200, {
+            'success': True, 'message': msg,
+            'alerts': self.app.ctrl.alerts,
+            'alert_cfg': dict(self.app.ctrl.alert_cfg),
+        })
 
     def _remap(self):
         ok, msg = self.app.ctrl.force_remap()

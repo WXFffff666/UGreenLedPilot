@@ -369,6 +369,38 @@ dialog input {
 }
 .dialog-actions { display: flex; gap: 8px; margin-top: 14px; }
 
+/* 强制改密弹窗（首次登录） */
+.pw-desc { font-size: 12px; color: var(--t2); margin-bottom: 8px; line-height: 1.5; }
+#pw-dialog.forced { border-color: var(--accent2, #00b4ff); }
+#pw-dialog.forced::backdrop { background: rgba(0, 0, 0, 0.8); backdrop-filter: blur(6px); }
+#pw-dialog.forced .dialog-actions { justify-content: flex-end; }
+
+/* T5: 故障告警横幅 */
+.alert-banner {
+  display: flex; align-items: center; gap: 10px;
+  margin: 10px 18px; padding: 10px 14px;
+  border-radius: 10px; border: 1px solid rgba(255, 92, 108, 0.4);
+  background: rgba(255, 92, 108, 0.12); color: var(--danger, #ff5c6c);
+  font-size: 13px;
+}
+.alert-banner[hidden] { display: none; }
+.alert-icon { font-size: 16px; }
+.alert-dismiss { margin-left: auto; min-width: 64px; padding: 5px 10px; font-size: 12px; }
+
+/* T3: 定时与告警设置区 */
+.settings { padding: 8px 18px 14px; }
+.setting-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px; align-items: end;
+}
+.setting-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--t2); }
+.setting-field input[type='number'] {
+  width: 100%; padding: 8px 10px; border-radius: 8px;
+  border: 1px solid var(--edge); background: rgba(6, 10, 16, 0.8); color: var(--t1);
+}
+.setting-field input[type='range'] { width: 100%; accent-color: var(--accent); }
+.setting-field em { font-style: normal; font-size: 11px; color: var(--t3); }
+
 /* 盘位校准对话框 */
 #cal-dialog { width: min(480px, 94vw); }
 .cal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }

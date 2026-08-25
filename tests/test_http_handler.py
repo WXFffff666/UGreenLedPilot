@@ -420,10 +420,14 @@ class TestStaticServing(_HandlerMixin, unittest.TestCase):
                 handler.send_response.assert_called_once_with(200)
                 sent = {c.args[0]: c.args[1]
                         for c in handler.send_header.call_args_list}
-                for sec in ('X-Content-Type-Options', 'X-Frame-Options',
-                            'Referrer-Policy', 'X-Robots-Tag',
-                            'Content-Security-Policy'):
+                for sec in ('X-Content-Type-Options', 'Referrer-Policy',
+                            'X-Robots-Tag', 'Content-Security-Policy'):
                     self.assertIn(sec, sent, f'{name} missing {sec}')
+                # fnOS desktop embeds the app in a cross-origin iframe; the
+                # CSP frame-ancestors directive replaces X-Frame-Options so
+                # the desktop origin (http/https) is allowed to frame us.
+                self.assertIn('frame-ancestors', sent['Content-Security-Policy'],
+                              f'{name} CSP must allow fnOS desktop framing')
 
     def test_static_broken_pipe_safe(self):
         handler = self.make_handler(path='/static/app.css')

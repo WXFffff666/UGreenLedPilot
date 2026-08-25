@@ -12,7 +12,7 @@ from pilot_core import (
 )
 from utils import load_json, save_json
 
-APP_VERSION = '2.2.1'
+APP_VERSION = '2.3.0'
 
 _BUNDLED = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ugreen_leds_cli')
 CLI = _BUNDLED if os.path.exists(_BUNDLED) else '/usr/local/bin/ugreen_leds_cli'
@@ -71,6 +71,8 @@ class AppContext:
             activity_blink=self.cfg.get('activity_blink', True),
             speed_blink=self.cfg.get('speed_blink', False),
             bay_bindings=self.cfg.get('bay_bindings', {}),
+            night_schedule=self.cfg.get('night_schedule', {}),
+            alert_cfg=self.cfg.get('alerts', {}),
         )
         self.ctrl.restore_state(hardware_modes=self.hardware_modes, apply_hardware=True)
         self.ctrl.start_monitor()
@@ -109,6 +111,10 @@ class AppContext:
             'ata_map': DXP4800_PLUS_PROFILE['ata_map'],
             'hctl_map': DXP4800_PLUS_PROFILE['hctl_map'],
             'activity_blink': True,
+            'night_schedule': {'enabled': False, 'start_hour': 22, 'end_hour': 7,
+                               'night_brightness': 13},
+            'alerts': {'enabled': False, 'disk_failure': True,
+                       'network_down': True},
         }
 
     def reset_controller(self):
@@ -124,6 +130,8 @@ class AppContext:
             activity_blink=self.cfg.get('activity_blink', True),
             speed_blink=self.cfg.get('speed_blink', False),
             bay_bindings=self.cfg.get('bay_bindings', {}),
+            night_schedule=self.cfg.get('night_schedule', {}),
+            alert_cfg=self.cfg.get('alerts', {}),
         )
         self.ctrl.restore_state(apply_hardware=True)
         self.ctrl.start_monitor()

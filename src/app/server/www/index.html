@@ -49,6 +49,39 @@
       </div>
       <p class="hint">常亮/关闭时监控线程休眠零开销；自动模式通过内核 uevent 仅在拔插时重扫；关闭活动闪烁可进一步降低 CPU。</p>
 
+      <div id="alert-banner" class="alert-banner" hidden>
+        <span class="alert-icon">⚠</span>
+        <span id="alert-text">设备告警</span>
+        <button type="button" class="abtn s alert-dismiss" id="alert-dismiss">知道了</button>
+      </div>
+
+      <section class="settings" id="settings-panel">
+        <h3 class="dtitle">定时与告警</h3>
+        <div class="setting-grid">
+          <label class="toggle-row" title="夜间窗口内自动调暗（或关闭）LED，白天自动恢复">
+            <input type="checkbox" id="night-enabled">
+            <span>夜间自动调暗</span>
+          </label>
+          <label class="setting-field">
+            <span>开始</span>
+            <input type="number" id="night-start" min="0" max="23" value="22">
+          </label>
+          <label class="setting-field">
+            <span>结束</span>
+            <input type="number" id="night-end" min="0" max="23" value="7">
+          </label>
+          <label class="setting-field">
+            <span>夜间亮度</span>
+            <input type="range" id="night-brightness" min="0" max="255" value="13">
+            <em id="night-brightness-val">13</em>
+          </label>
+          <label class="toggle-row" title="磁盘消失 / 网络断开时以红色闪烁告警">
+            <input type="checkbox" id="alerts-enabled">
+            <span>故障告警</span>
+          </label>
+        </div>
+      </section>
+
       <section class="sys-grid" id="sys-grid">
         <article class="sys-card sitem" data-led="power">
           <div class="sys-top">
@@ -110,9 +143,10 @@
     </main>
   </div>
 
-  <dialog id="pw-dialog">
+  <dialog id="pw-dialog" data-force="false">
     <form method="dialog" id="pw-form">
-      <h3>修改密码</h3>
+      <h3 id="pw-title">修改密码</h3>
+      <p id="pw-desc" class="pw-desc">修改后将需重新登录</p>
       <input id="pw-old" type="password" placeholder="旧密码" required>
       <input id="pw-new" type="password" placeholder="新密码 (至少8位)" required minlength="8">
       <div class="dialog-actions">

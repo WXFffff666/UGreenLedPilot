@@ -141,10 +141,44 @@
       setChaseBtn(document.getElementById('btn-chase'), chaseOn);
     }
 
+    // T3/T5: night schedule + alert state from status/SSE
+    if (data.night_schedule !== undefined) {
+      const ne = document.getElementById('night-enabled');
+      const ns = document.getElementById('night-start');
+      const nend = document.getElementById('night-end');
+      const nb = document.getElementById('night-brightness');
+      if (ne) ne.checked = !!data.night_schedule.enabled;
+      if (ns && data.night_schedule.start_hour !== undefined) ns.value = data.night_schedule.start_hour;
+      if (nend && data.night_schedule.end_hour !== undefined) nend.value = data.night_schedule.end_hour;
+      if (nb && data.night_schedule.night_brightness !== undefined) {
+        nb.value = data.night_schedule.night_brightness;
+        const val = document.getElementById('night-brightness-val');
+        if (val) val.textContent = data.night_schedule.night_brightness;
+      }
+    }
+    if (data.alerts !== undefined) renderAlertBanner(data.alerts);
+
     if (data.presence) {
       for (const led in data.presence) {
         updateUI(led, modes[led] || 'off', !!(data.activity && data.activity[led]), data.presence[led]);
       }
+    }
+  }
+
+  function renderAlertBanner(alerts) {
+    const banner = document.getElementById('alert-banner');
+    const text = document.getElementById('alert-text');
+    if (!banner || !text) return;
+    const parts = [];
+    const lost = alerts.disk_lost || {};
+    const diskBays = Object.keys(lost).filter((k) => lost[k]);
+    if (diskBays.length) parts.push('磁盘盘位故障: ' + diskBays.map((k) => k.replace('disk', '#')).join(', '));
+    if (alerts.network_down) parts.push('网络已断开');
+    if (parts.length) {
+      text.textContent = parts.join(' · ');
+      banner.hidden = false;
+    } else {
+      banner.hidden = true;
     }
   }
 
@@ -316,6 +350,47 @@
       });
     }
 
+    // T3: night schedule settings
+    const nightEnabled = document.getElementById('night-enabled');
+    const nightStart = document.getElementById('night-start');
+    const nightEnd = document.getElementById('night-end');
+    const nightBright = document.getElementById('night-brightness');
+    function postNightSchedule() {
+      if (!nightEnabled || !nightStart || !nightEnd || !nightBright) return;
+      api('POST', '/api/night-schedule', {
+        enabled: nightEnabled.checked,
+        start_hour: parseInt(nightStart.value, 10) || 22,
+        end_hour: parseInt(nightEnd.value, 10) || 7,
+        night_brightness: parseInt(nightBright.value, 10) || 13,
+      }).then((r) => {
+        toast(r.success ? '定时策略已保存' : r.message, r.success ? 'ok' : 'err');
+      });
+    }
+    if (nightEnabled) nightEnabled.onchange = postNightSchedule;
+    if (nightStart) nightStart.onchange = postNightSchedule;
+    if (nightEnd) nightEnd.onchange = postNightSchedule;
+    if (nightBright) {
+      nightBright.oninput = () => {
+        const val = document.getElementById('night-brightness-val');
+        if (val) val.textContent = nightBright.value;
+      };
+      nightBright.onchange = postNightSchedule;
+    }
+
+    // T5: alerts toggle
+    const alertsToggle = document.getElementById('alerts-enabled');
+    if (alertsToggle) {
+      alertsToggle.onchange = () => api('POST', '/api/alerts', {
+        enabled: alertsToggle.checked, disk_failure: true, network_down: true,
+      }).then((r) => {
+        toast(r.success ? (alertsToggle.checked ? '故障告警已开启' : '故障告警已关闭') : r.message, r.success ? 'ok' : 'err');
+      });
+    }
+    const alertDismiss = document.getElementById('alert-dismiss');
+    if (alertDismiss) {
+      alertDismiss.onclick = () => { const b = document.getElementById('alert-banner'); if (b) b.hidden = true; };
+    }
+
     document.getElementById('btn-all-on').onclick = () => allMode('on');
     document.getElementById('btn-all-auto').onclick = () => allMode('auto');
     document.getElementById('btn-all-off').onclick = () => allMode('off');
@@ -444,8 +519,24 @@
       bindControls();
       leds.forEach((l) => updateUI(l, modes[l] || 'off'));
       connectSSE();
-      if (r.must_change_password) toast('请尽快修改默认密码', 'err');
+      if (r.must_change_password) forceChangePassword();
     });
+  }
+
+  // First-login / default-credential flow: the change-password dialog becomes
+  // a blocking modal — no cancel, no backdrop/Escape close — until the admin
+  // sets a real password. Guards against leaving the default admin123 in place.
+  function forceChangePassword() {
+    const dlg = document.getElementById('pw-dialog');
+    const cancel = document.getElementById('pw-cancel');
+    if (!dlg) return;
+    dlg.dataset.force = 'true';
+    dlg.classList.add('forced');
+    if (cancel) cancel.style.display = 'none';
+    document.getElementById('pw-desc').textContent = '首次登录，请先修改默认密码后才能使用';
+    document.getElementById('pw-title').textContent = '设置新密码';
+    dlg.showModal();
+    dlg.addEventListener('cancel', (e) => { e.preventDefault(); }, { once: true });
   }
 
   if (document.readyState === 'loading') {

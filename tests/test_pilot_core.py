@@ -1677,5 +1677,204 @@ class TestAppContextAsyncProbe(unittest.TestCase):
                 fake_ctrl.reset_mock()
 
 
+class TestNightSchedule(_PilotTestCase):
+    """定时策略（T3）：夜间窗口自动调暗/关闭，白天自动恢复。
+
+    Uses an injectable wall clock (time.localtime shaped) so the window
+    logic is testable without waiting for real wall time.
+    """
+
+    def _make_ctrl(self, disk_count=2):
+        ctrl = super()._make_ctrl(disk_count=disk_count)
+        ctrl._uevent = MagicMock()
+        ctrl._uevent.is_running.return_value = False
+        return ctrl
+
+    def _clock_at(self, hour, minute=0):
+        """Return a struct_time for the given wall-clock hour (today)."""
+        return time.struct_time((2026, 1, 1, hour, minute, 0, 0, 1, -1))
+
+    def test_default_disabled(self):
+        ctrl = self._make_ctrl()
+        self.assertFalse(ctrl.night_schedule['enabled'])
+        self.assertFalse(ctrl.night_active)
+
+    def test_in_night_window_cross_midnight(self):
+        ctrl = self._make_ctrl()
+        ctrl.night_schedule = {'enabled': True, 'start_hour': 22, 'end_hour': 7,
+                               'night_brightness': 13}
+        self.assertTrue(ctrl._in_night_window(self._clock_at(23)))
+        self.assertTrue(ctrl._in_night_window(self._clock_at(6, 59)))
+        self.assertFalse(ctrl._in_night_window(self._clock_at(21)))
+        self.assertFalse(ctrl._in_night_window(self._clock_at(7)))
+        self.assertFalse(ctrl._in_night_window(self._clock_at(12)))
+
+    def test_in_night_window_same_day(self):
+        ctrl = self._make_ctrl()
+        ctrl.night_schedule = {'enabled': True, 'start_hour': 13, 'end_hour': 17,
+                               'night_brightness': 13}
+        self.assertTrue(ctrl._in_night_window(self._clock_at(14)))
+        self.assertFalse(ctrl._in_night_window(self._clock_at(18)))
+
+    def test_set_night_schedule_validates(self):
+        ctrl = self._make_ctrl()
+        ok, _ = ctrl.set_night_schedule(
+            {'enabled': True, 'start_hour': 24, 'end_hour': 7, 'night_brightness': 13})
+        self.assertFalse(ok, 'start_hour out of range must be rejected')
+        ok, _ = ctrl.set_night_schedule(
+            {'enabled': True, 'start_hour': 22, 'end_hour': 7, 'night_brightness': 300})
+        self.assertFalse(ok, 'night_brightness out of range must be rejected')
+
+    def test_night_active_applies_dim_brightness(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes = {'power': 'on', 'netdev': 'on', 'disk1': 'on', 'disk2': 'on'}
+        ctrl.night_schedule = {'enabled': True, 'start_hour': 22, 'end_hour': 7,
+                               'night_brightness': 13}
+        ctrl.night_active = True
+        ctrl.run.reset_mock()
+        ok, _ = ctrl._apply('power', 'on')
+        self.assertTrue(ok)
+        call = ctrl.run.call_args
+        self.assertIsNotNone(call)
+        args = call.args
+        self.assertIn('-brightness', args)
+        self.assertEqual(args[args.index('-brightness') + 1], '13',
+                         'night dimming must override brightness to 13')
+
+    def test_night_brightness_zero_turns_off(self):
+        ctrl = self._make_ctrl()
+        ctrl.modes = {'power': 'on', 'netdev': 'off', 'disk1': 'off', 'disk2': 'off'}
+        ctrl.night_schedule = {'enabled': True, 'start_hour': 22, 'end_hour': 7,
+                               'night_brightness': 0}
+        ctrl.night_active = True
+        ctrl.run.reset_mock()
+        ok, _ = ctrl._apply('power', 'on')
+        self.assertTrue(ok)
+        args = ctrl.run.call_args.args
+        self.assertIn('-off', args, 'night_brightness=0 must emit -off')
+
+    def test_evaluate_night_mode_state_transition_notifies(self):
+        ctrl = self._make_ctrl()
+        ctrl.night_schedule = {'enabled': True, 'start_hour': 22, 'end_hour': 7,
+                               'night_brightness': 13}
+        ctrl._now = lambda: self._clock_at(23)   # in-window
+        changed = ctrl._evaluate_night_mode()
+        self.assertTrue(changed)
+        self.assertTrue(ctrl.night_active)
+        changed = ctrl._evaluate_night_mode()    # same window, no change
+        self.assertFalse(changed)
+        ctrl._now = lambda: self._clock_at(8)    # out-of-window
+        changed = ctrl._evaluate_night_mode()
+        self.assertTrue(changed)
+        self.assertFalse(ctrl.night_active)
+
+    def test_status_exposes_night_schedule(self):
+        ctrl = self._make_ctrl()
+        status = ctrl.get_status()
+        self.assertIn('night_schedule', status)
+        self.assertIn('night_active', status)
+        self.assertFalse(status['night_active'])
+
+
+class TestAlerts(_PilotTestCase):
+    """故障告警（T5）：磁盘消失/断网 debounce 后触发红色闪烁告警。"""
+
+    def _make_ctrl(self, disk_count=2):
+        ctrl = super()._make_ctrl(disk_count=disk_count)
+        ctrl._uevent = MagicMock()
+        ctrl._uevent.is_running.return_value = False
+        return ctrl
+
+    def _enable(self, ctrl):
+        ctrl.set_alert_config({'enabled': True, 'disk_failure': True,
+                               'network_down': True})
+
+    def test_alert_config_default_off(self):
+        ctrl = self._make_ctrl()
+        self.assertFalse(ctrl.alert_cfg['enabled'])
+        self.assertEqual(ctrl.alerts, {'disk_lost': {}, 'network_down': False})
+
+    def test_set_alert_config_validates(self):
+        ctrl = self._make_ctrl()
+        ok, _ = ctrl.set_alert_config({'enabled': 'not-bool'})
+        self.assertFalse(ok)
+
+    def test_disk_loss_debounced_triggers_alert(self):
+        ctrl = self._make_ctrl()
+        self._enable(ctrl)
+        ctrl._disk_map = {1: 'sda'}
+        ctrl.modes['disk1'] = 'auto'
+        ctrl.presence['disk1'] = True
+        with patch('pilot_core.disk_present', return_value=False):
+            for _ in range(2):
+                ctrl._check_disks()          # below threshold
+            self.assertNotIn('disk1', ctrl.alerts['disk_lost'])
+            ctrl._check_disks()              # 3rd check -> alert
+        self.assertIn('disk1', ctrl.alerts['disk_lost'])
+        self.assertTrue(ctrl.alerts['disk_lost']['disk1'])
+        # red blink CLI emitted
+        self.assertTrue(any('-blink' in c.args and '255' in c.args and '64' in c.args
+                            for c in ctrl.run.call_args_list),
+                        'alert must emit a red blink CLI')
+
+    def test_disk_replug_clears_alert(self):
+        ctrl = self._make_ctrl()
+        self._enable(ctrl)
+        ctrl._disk_map = {1: 'sda'}
+        ctrl.modes['disk1'] = 'auto'
+        ctrl.presence['disk1'] = True
+        with patch('pilot_core.disk_present', return_value=False):
+            for _ in range(3):
+                ctrl._check_disks()
+        self.assertIn('disk1', ctrl.alerts['disk_lost'])
+        with patch('pilot_core.disk_present', return_value=True), \
+                patch('pilot_core.read_disk_io', return_value=0):
+            ctrl._check_disks()
+        self.assertNotIn('disk1', ctrl.alerts['disk_lost'])
+
+    def test_network_down_debounced_alert(self):
+        ctrl = self._make_ctrl()
+        self._enable(ctrl)
+        ctrl.modes['netdev'] = 'auto'
+        ctrl.activity['netdev'] = True
+        with patch('pilot_core.list_net_ifaces', return_value=[]), \
+                patch('pilot_core.detect_net_iface', return_value=None):
+            for _ in range(2):
+                ctrl._check_network()
+            self.assertFalse(ctrl.alerts['network_down'])
+            ctrl._check_network()
+        self.assertTrue(ctrl.alerts['network_down'])
+
+    def test_network_up_clears_alert(self):
+        ctrl = self._make_ctrl()
+        self._enable(ctrl)
+        ctrl.modes['netdev'] = 'auto'
+        ctrl.alerts['network_down'] = True
+        ctrl._net_down_count = 3
+        with patch('pilot_core.list_net_ifaces', return_value=['eth0']), \
+                patch('pilot_core.detect_net_iface', return_value='eth0'), \
+                patch('pilot_core.read_stats', return_value=0):
+            ctrl._check_network()
+        self.assertFalse(ctrl.alerts['network_down'])
+        self.assertEqual(ctrl._net_down_count, 0)
+
+    def test_disabled_alert_is_noop(self):
+        ctrl = self._make_ctrl()          # alert_cfg disabled by default
+        ctrl._disk_map = {1: 'sda'}
+        ctrl.modes['disk1'] = 'auto'
+        ctrl.presence['disk1'] = True
+        with patch('pilot_core.disk_present', return_value=False):
+            for _ in range(5):
+                ctrl._check_disks()
+        self.assertEqual(ctrl.alerts['disk_lost'], {},
+                         'disabled alert config must not raise alerts')
+
+    def test_status_exposes_alerts(self):
+        ctrl = self._make_ctrl()
+        status = ctrl.get_status()
+        self.assertIn('alerts', status)
+        self.assertIn('alert_cfg', status)
+
+
 if __name__ == '__main__':
     unittest.main()

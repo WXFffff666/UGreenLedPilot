@@ -59,6 +59,12 @@ ACTIVITY_SLOW_INTERVAL = 3.0
 HOTPLUG_FALLBACK_INTERVAL = 120.0
 SLEEP_WAKE_TIMEOUT = 3600.0
 IDENTIFY_DURATION = 10.0  # seconds — identify() blink self-expires (C4)
+NIGHT_CHECK_INTERVAL = 60.0      # seconds — night-schedule evaluation cadence
+NIGHT_DEFAULT_BRIGHTNESS = 13    # ≈5% dim level when the night window is active
+ALERT_DEBOUNCE_CHECKS = 3        # consecutive checks before a failure is alerted
+ALERT_BLINK_ON_MS = 200          # red alert blink timing
+ALERT_BLINK_OFF_MS = 200
+ALERT_RED = [255, 64, 64]        # distinctive alert colour
 
 WHITE = [255, 255, 255]
 NETDEV_ORANGE = [255, 165, 0]
@@ -370,7 +376,8 @@ class PilotController:
 
     def __init__(self, led_names, run, state_file, settings_file,
                  ata_map=None, hctl_map=None, disk_count=4, broadcaster=None,
-                 activity_blink=True, speed_blink=False, bay_bindings=None):
+                 activity_blink=True, speed_blink=False, bay_bindings=None,
+                 night_schedule=None, alert_cfg=None):
         self.leds = led_names
         self.run = run
         self.state_file = state_file
@@ -419,6 +426,30 @@ class PilotController:
         self._identify_until = 0.0
         self._identify_led = None
         self._uevent = UeventWatcher(self._on_uevent_hotplug)
+        self.night_schedule = {
+            'enabled': False, 'start_hour': 22, 'end_hour': 7,
+            'night_brightness': NIGHT_DEFAULT_BRIGHTNESS,
+        }
+        ns = night_schedule or {}
+        try:
+            self.night_schedule['enabled'] = bool(ns.get('enabled', False))
+            self.night_schedule['start_hour'] = int(ns.get('start_hour', 22))
+            self.night_schedule['end_hour'] = int(ns.get('end_hour', 7))
+            self.night_schedule['night_brightness'] = int(
+                ns.get('night_brightness', NIGHT_DEFAULT_BRIGHTNESS))
+        except (TypeError, ValueError):
+            pass  # keep defaults on malformed config
+        self.night_active = False
+        self._now = time.localtime  # injectable wall clock for tests
+        ac = alert_cfg or {}
+        self.alert_cfg = {
+            'enabled': bool(ac.get('enabled', False)),
+            'disk_failure': bool(ac.get('disk_failure', True)),
+            'network_down': bool(ac.get('network_down', True)),
+        }
+        self.alerts = {'disk_lost': {}, 'network_down': False}
+        self._alert_absent = {}     # slot -> consecutive-absent count
+        self._net_down_count = 0
 
     def _load_settings(self):
         saved = load_json(self.settings_file, {})
@@ -671,6 +702,104 @@ class PilotController:
             self._notify()
             return True, 'OK'
 
+    def set_night_schedule(self, schedule):
+        """Configure the night window (auto-dim) and evaluate immediately.
+
+        schedule keys: enabled(bool), start_hour(0-23), end_hour(0-23),
+        night_brightness(0-255). 0 = fully off during the window.
+        """
+        try:
+            enabled = bool(schedule.get('enabled', False))
+            start = int(schedule.get('start_hour', 22))
+            end = int(schedule.get('end_hour', 7))
+            bright = int(schedule.get('night_brightness', NIGHT_DEFAULT_BRIGHTNESS))
+        except (TypeError, ValueError):
+            return False, '无效参数'
+        if not (0 <= start <= 23 and 0 <= end <= 23 and 0 <= bright <= 255):
+            return False, '无效参数'
+        with self._lock:
+            self.night_schedule = {
+                'enabled': enabled, 'start_hour': start, 'end_hour': end,
+                'night_brightness': bright,
+            }
+            self._evaluate_night_mode()
+            self._notify()
+            return True, 'OK'
+
+    def _in_night_window(self, lt=None):
+        """True when the wall clock falls in [start_hour, end_hour).
+
+        Supports cross-midnight windows (start > end, e.g. 22 -> 7):
+        in-window iff hour >= start or hour < end. Non-crossing windows
+        (start <= end) are in-window iff start <= hour < end.
+        """
+        lt = lt or self._now()
+        hour = lt.tm_hour
+        s, e = self.night_schedule['start_hour'], self.night_schedule['end_hour']
+        if s == e:
+            return False
+        if s > e:
+            return hour >= s or hour < e
+        return s <= hour < e
+
+    def _evaluate_night_mode(self):
+        """Recompute night_active from the schedule; re-emit LEDs on change.
+
+        Returns True when the active state flipped (callers then _notify()).
+        """
+        if not self.night_schedule.get('enabled'):
+            if not self.night_active:
+                return False
+            self.night_active = False
+            self._reapply_all()
+            return True
+        active = self._in_night_window()
+        if active == self.night_active:
+            return False
+        self.night_active = active
+        self._reapply_all()
+        return True
+
+    def _reapply_all(self):
+        """Force a CLI re-emit of every non-off LED (night dim/restore)."""
+        for led in self.leds:
+            mode = self.modes.get(led, 'off')
+            if mode == 'off':
+                continue
+            self._last_applied.pop(led, None)
+            self._apply(led, mode, activity=self.activity.get(led, False))
+
+    def _night_effective_brightness(self, cfg_brightness):
+        """Day brightness unless night window is active and dimmer."""
+        if self.night_active:
+            night_b = self.night_schedule.get('night_brightness', NIGHT_DEFAULT_BRIGHTNESS)
+            return min(cfg_brightness, night_b)
+        return cfg_brightness
+
+    def set_alert_config(self, cfg):
+        """Configure failure alerts (disk loss / network down).
+
+        cfg keys: enabled(bool), disk_failure(bool), network_down(bool).
+        Changing the config resets debounce counters so a fresh condition
+        is required before the next alert.
+        """
+        if not isinstance(cfg, dict):
+            return False, '无效参数'
+        for key in ('enabled', 'disk_failure', 'network_down'):
+            if key in cfg and not isinstance(cfg[key], bool):
+                return False, '无效参数'
+        with self._lock:
+            self.alert_cfg = {
+                'enabled': bool(cfg.get('enabled', False)),
+                'disk_failure': bool(cfg.get('disk_failure', True)),
+                'network_down': bool(cfg.get('network_down', True)),
+            }
+            self._alert_absent = {}
+            self._net_down_count = 0
+            self.alerts = {'disk_lost': {}, 'network_down': False}
+            self._notify()
+            return True, 'OK'
+
     def set_chase(self, enabled):
         """Demo chase (running light) over the disk LEDs.
 
@@ -725,20 +854,22 @@ class PilotController:
         self._net_sig = net_signature()
 
     def _apply_key(self, led, mode, activity, effect=None, t_on=None, t_off=None,
-                   blink_params=None):
+                   blink_params=None, alert=False):
         # Dedup key contract (K2): the key must encode every input that
         # changes the emitted CLI command — mode, activity, effect timing and
         # presence (disk present / NIC carrier). presence must be part of the
         # key: without it a pull/replug while idle produces the same key as
         # the steady-on state and the dedup skips the -off/-on transition,
-        # leaving the LED lit / dark (H1).
+        # leaving the LED lit / dark (H1). night_active and alert also change
+        # the emitted CLI, so they are part of the key too.
         cfg = self.get_settings(led)
         presence = self.presence.get(led, False)
+        night = self.night_active
         if effect == 'breath':
             return (mode, activity, effect, t_on, t_off,
-                    tuple(cfg['color']), cfg['brightness'], presence)
+                    tuple(cfg['color']), cfg['brightness'], presence, night, alert)
         return (mode, activity, effect, blink_params,
-                tuple(cfg['color']), cfg['brightness'], presence)
+                tuple(cfg['color']), cfg['brightness'], presence, night, alert)
 
     def restore_state(self, hardware_modes=None, apply_hardware=True):
         hardware_modes = hardware_modes or {}
@@ -761,6 +892,8 @@ class PilotController:
                     ok, msg = self._apply(led, mode, activity=False)
                     if not ok:
                         print(f'Restore {led} failed: {msg}')
+            # T3: apply night dimming at boot if the window is active
+            self._evaluate_night_mode()
             self._notify()
 
     def set_mode(self, led, mode):
@@ -813,7 +946,7 @@ class PilotController:
             self._notify()
         return ok, err
 
-    def _apply(self, led, mode, activity=False, blink_params=None):
+    def _apply(self, led, mode, activity=False, blink_params=None, alert=False):
         # priority matrix (F7): mode 'off' outranks every effect and
         # user effects (manual-blink/breath) outrank auto activity-blink —
         # both are enforced by the branch order below
@@ -823,15 +956,26 @@ class PilotController:
             cfg0 = self.get_settings(led)
             t_on = cfg0.get('breath_t_on', BREATH_ON_MS)
             t_off = cfg0.get('breath_t_off', BREATH_OFF_MS)
-        key = self._apply_key(led, mode, activity, effect, t_on, t_off, blink_params)
+        key = self._apply_key(led, mode, activity, effect, t_on, t_off, blink_params,
+                          alert=alert)
         if self._last_applied.get(led) == key:
             return True, 'OK'
 
         cfg = self.get_settings(led)
         cr, cg, cb = map(str, cfg['color'])
-        brightness = str(cfg['brightness'])
+        brightness = str(self._night_effective_brightness(cfg['brightness']))
 
         if mode == 'off':
+            ok, _, err = self.run(led, '-off')
+        elif alert:
+            # T5: failure alert — red blink, distinct from normal activity blink
+            ok, _, err = self.run(
+                led, '-on', '-blink', str(ALERT_BLINK_ON_MS), str(ALERT_BLINK_OFF_MS),
+                '-color', str(ALERT_RED[0]), str(ALERT_RED[1]), str(ALERT_RED[2]),
+                '-brightness', brightness,
+            )
+        elif self.night_active and self.night_schedule.get('night_brightness') == 0:
+            # night window with night_brightness=0 → turn the LED fully off
             ok, _, err = self.run(led, '-off')
         elif effect == 'breath':
             ok, _, err = self.run(
@@ -1035,11 +1179,21 @@ class PilotController:
                         self._last_applied.pop(led, None)
                         self._apply(led, self.modes.get(led, 'off'))
 
+            # T3: re-evaluate the night window (dim/restore) on every tick
+            with self._lock:
+                if self._evaluate_night_mode():
+                    self._notify()
+
             if tier == 'sleep':
                 timeout = SLEEP_WAKE_TIMEOUT
                 if self._identify_until:
                     # C4: don't sleep past a pending identify expiry
                     timeout = min(timeout, self._identify_until - time.monotonic())
+                if self.night_schedule.get('enabled'):
+                    # T3: wake at least every minute to re-evaluate the night
+                    # window so the dim/restore transition happens on time
+                    # even while the monitor is sleeping.
+                    timeout = min(timeout, NIGHT_CHECK_INTERVAL)
                 self._wake_event.wait(timeout=timeout)
                 self._wake_event.clear()
                 continue
@@ -1128,6 +1282,14 @@ class PilotController:
             # all NICs down -> the netdev LED must go dark even when already
             # idle. Flip presence first so the dedup key changes and -off is
             # not skipped (same mechanism as _check_disks, H1).
+            # T5: network-down alert — debounce consecutive ticks, then mark.
+            if self.alert_cfg.get('enabled') and self.alert_cfg.get('network_down'):
+                self._net_down_count += 1
+                if (self._net_down_count >= ALERT_DEBOUNCE_CHECKS
+                        and not self.alerts['network_down']):
+                    self.alerts['network_down'] = True
+                    self._last_applied.pop(led, None)
+                    self._apply(led, 'auto', activity=False, alert=True)
             self.presence[led] = False
             if self.activity.get(led):
                 self.activity[led] = False
@@ -1138,6 +1300,11 @@ class PilotController:
                 self._apply(led, 'auto', activity=False)
                 return True
             return False
+        # NIC(s) up — clear a pending network alert
+        if self._net_down_count or self.alerts.get('network_down'):
+            self._net_down_count = 0
+            self.alerts['network_down'] = False
+            self._last_applied.pop(led, None)
         self.presence[led] = True
         delta = 0
         for iface in self._net_ifaces:
@@ -1172,6 +1339,19 @@ class PilotController:
                 continue
             dev = self._disk_map.get(slot)
             if not disk_present(dev):
+                # T5: disk failure alert — debounce consecutive absences so a
+                # brief /sys hiccup does not fire a false alert, then blink red.
+                if (self.alert_cfg.get('enabled')
+                        and self.alert_cfg.get('disk_failure')
+                        and self.modes.get(led) != 'off'):
+                    count = self._alert_absent.get(slot, 0) + 1
+                    self._alert_absent[slot] = count
+                    if count >= ALERT_DEBOUNCE_CHECKS:
+                        if not self.alerts['disk_lost'].get(led):
+                            self.alerts['disk_lost'][led] = True
+                            self._last_applied.pop(led, None)
+                            self._apply(led, 'auto', activity=False, alert=True)
+                            changed = True
                 if self.activity.get(led) or self.presence.get(led):
                     self.activity[led] = False
                     self.presence[led] = False
@@ -1180,6 +1360,13 @@ class PilotController:
                 self._prev_disk_io.pop(slot, None)
                 self._last_disk_check.pop(slot, None)
                 continue
+            # disk present — clear any pending alert for this slot
+            cleared = self._alert_absent.pop(slot, None) is not None
+            if self.alerts['disk_lost'].pop(led, None) is not None:
+                cleared = True
+            if cleared:
+                self._last_applied.pop(led, None)
+                changed = True
             self.presence[led] = True
             io = read_disk_io(f'/sys/block/{dev}/stat')
             prev = self._prev_disk_io.get(slot, 0)
@@ -1216,6 +1403,9 @@ class PilotController:
                 'monitor_tier': self._monitor_tier(),
                 'activity_blink': self.activity_blink_enabled,
                 'speed_blink': self.speed_blink_enabled,
+                'night_active': self.night_active,
+                'alerts': {'disk_lost': dict(self.alerts['disk_lost']),
+                           'network_down': self.alerts['network_down']},
                 'uevent_available': self._uevent.available,
                 'rescan_count': self._rescan_count,
                 'version': self.broadcaster.version,
@@ -1238,6 +1428,11 @@ class PilotController:
                 'monitor_tier': self._monitor_tier(),
                 'activity_blink': self.activity_blink_enabled,
                 'speed_blink': self.speed_blink_enabled,
+                'night_schedule': dict(self.night_schedule),
+                'night_active': self.night_active,
+                'alerts': {'disk_lost': dict(self.alerts['disk_lost']),
+                           'network_down': self.alerts['network_down']},
+                'alert_cfg': dict(self.alert_cfg),
                 'uevent_available': self._uevent.available,
                 'rescan_count': self._rescan_count,
                 'model': DXP4800_PLUS_PROFILE,
