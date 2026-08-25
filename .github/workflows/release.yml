@@ -17,6 +17,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Ensure wizard dir exists
+        run: |
+          # fnpack requires the wizard/ directory, and tests assert it exists.
+          # Git does not track empty directories, so it must be created
+          # explicitly after checkout — before the unit tests run.
+          mkdir -p src/wizard
+          ls -la src/wizard
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Install fnpack
         run: |
           curl -fsSL https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64 -o fnpack
@@ -50,13 +63,6 @@ jobs:
           sed -i "s/^version[[:space:]]*=.*/version               = ${VERSION}/" src/manifest
           echo "Manifest version set to: ${VERSION}"
           grep '^version' src/manifest
-
-      - name: Ensure wizard dir exists
-        run: |
-          # fnpack requires the wizard/ directory. Git does not track empty
-          # directories, so it must be created explicitly after checkout.
-          mkdir -p src/wizard
-          ls -la src/wizard
 
       - name: Build fpk
         working-directory: src

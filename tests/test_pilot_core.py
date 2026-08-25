@@ -992,7 +992,13 @@ class TestMultiNicMonitoring(_PilotTestCase):
         ctrl._net_iface = None
         ctrl._net_ifaces = []
         ctrl.activity['netdev'] = True
-        with patch('pilot_core.read_stats') as mock_read:
+        # _check_network() re-detects NICs every tick; pin them down so the
+        # "all NICs down" branch is exercised regardless of the host's real
+        # network state (CI runners have a live eth0 which previously leaked
+        # MagicMock stats into the `delta >= threshold` comparison).
+        with patch('pilot_core.read_stats') as mock_read, \
+                patch('pilot_core.list_net_ifaces', return_value=[]), \
+                patch('pilot_core.detect_net_iface', return_value=None):
             changed = ctrl._check_network()
         self.assertTrue(changed)
         self.assertFalse(ctrl.activity['netdev'])
