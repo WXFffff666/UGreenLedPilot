@@ -40,6 +40,13 @@ jobs:
         run: |
           python -m unittest discover -s tests -v
 
+      - name: Clean Python caches
+        run: |
+          # Unit tests import the server modules, leaving __pycache__ that
+          # must not be packaged into the fpk.
+          find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+          find src -name '*.pyc' -delete 2>/dev/null || true
+
       - name: Build ugreen_leds_cli
         run: |
           docker run --platform linux/amd64 --rm \
