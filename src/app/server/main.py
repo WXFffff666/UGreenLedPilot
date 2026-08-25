@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UGreenLedPilot v2.3.0 — entry point."""
+"""UGreenLedPilot v2.3.1 — entry point."""
 
 import signal
 import threading

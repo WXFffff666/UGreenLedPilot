@@ -12,7 +12,7 @@ from pilot_core import (
 )
 from utils import load_json, save_json
 
-APP_VERSION = '2.3.0'
+APP_VERSION = '2.3.1'
 
 _BUNDLED = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ugreen_leds_cli')
 CLI = _BUNDLED if os.path.exists(_BUNDLED) else '/usr/local/bin/ugreen_leds_cli'
@@ -99,7 +99,7 @@ class AppContext:
         self.hardware_modes = {led: d['mode'] for led, d in led_statuses.items()}
         self.probe_pending = False
         print(f'[AppContext] LED probe done in {time.monotonic() - start:.2f}s'
-              f' — {len(led_statuses)} LEDs detected, error={probe_error!r}')
+              f' —{len(led_statuses)} LEDs detected, error={probe_error!r}')
 
     def _default_config(self):
         return {

@@ -1876,5 +1876,102 @@ class TestAlerts(_PilotTestCase):
         self.assertIn('alert_cfg', status)
 
 
+class TestI2CEnsure(unittest.TestCase):
+    """I2C 自愈：CLI 报 'fail to open the I2C device' 时自动 modprobe 重试。
+
+    Root cause: install_init only loads i2c-dev at install time; after a
+    reboot the module is gone, /dev/i2c-* nodes vanish, and every CLI call
+    fails. The app runs as root, so a runtime modprobe + retry is possible.
+    """
+
+    def _mock_subprocess(self, side_effect):
+        patcher = patch('pilot_core.subprocess.run', side_effect=side_effect)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_ensure_i2c_loads_module_when_devices_missing(self):
+        """No /dev/i2c-* initially -> modprobe i2c-dev is attempted."""
+        import pilot_core
+        self._mock_subprocess(MagicMock(return_value=MagicMock()))
+        with patch('pilot_core.glob.glob', side_effect=[[], ['/dev/i2c-0']]) as mock_glob:
+            ok = pilot_core.ensure_i2c_dev()
+        self.assertTrue(ok, 'ensure_i2c_dev should succeed once devices appear')
+        modprobe_calls = [c for c in pilot_core.subprocess.run.call_args_list
+                          if c.args and c.args[0] and c.args[0][0] == 'modprobe']
+        self.assertTrue(modprobe_calls, 'modprobe should be invoked when devices are missing')
+        self.assertEqual(mock_glob.call_count, 2, 'glob checked before and after modprobe')
+
+    def test_ensure_i2c_noop_when_devices_present(self):
+        """/dev/i2c-* already present -> no modprobe needed."""
+        import pilot_core
+        self._mock_subprocess(MagicMock(return_value=MagicMock()))
+        with patch('pilot_core.glob.glob', return_value=['/dev/i2c-0']):
+            ok = pilot_core.ensure_i2c_dev()
+        self.assertTrue(ok)
+        modprobe_calls = [c for c in pilot_core.subprocess.run.call_args_list
+                          if c.args and c.args[0] and c.args[0][0] == 'modprobe']
+        self.assertFalse(modprobe_calls,
+                         'modprobe must not run when /dev/i2c-* already exists')
+
+    def test_ensure_i2c_false_when_still_missing(self):
+        """modprobe attempted but no devices -> False (heal failed)."""
+        import pilot_core
+        self._mock_subprocess(MagicMock(return_value=MagicMock()))
+        with patch('pilot_core.glob.glob', return_value=[]):
+            ok = pilot_core.ensure_i2c_dev()
+        self.assertFalse(ok)
+
+    def test_cli_runner_selfheals_on_i2c_error(self):
+        """First CLI call fails with I2C error, heal succeeds, retry works."""
+        import pilot_core
+        fake = MagicMock()
+        fake.stdout = ''
+        fake.stderr = 'Err: fail to open the I2C device. Please check...'
+        fake.returncode = 1
+        good = MagicMock()
+        good.stdout = 'power: status = on, brightness = 255, color = RGB(255,255,255)'
+        good.stderr = ''
+        good.returncode = 0
+        # CLI is invoked exactly twice; ensure_i2c_dev internals are covered
+        # by the TestI2CEnsure.ensure_* tests, so stub it to succeed here.
+        self._mock_subprocess([fake, good])
+        with patch('pilot_core.ensure_i2c_dev', return_value=True):
+            runner = pilot_core.make_cli_runner('/usr/local/bin/ugreen_leds_cli')
+            ok, out, err = runner('power', '-on')
+        self.assertTrue(ok, 'runner should retry and succeed after heal')
+        self.assertIn('power', out)
+        self.assertEqual(pilot_core.subprocess.run.call_count, 2,
+                         'CLI invoked twice: once failing, once after heal')
+
+    def test_cli_runner_no_selfheal_on_other_error(self):
+        """Non-I2C errors (e.g. CLI not a valid binary) must NOT trigger heal."""
+        import pilot_core
+        fake = MagicMock()
+        fake.stdout = ''
+        fake.stderr = 'some other error'
+        fake.returncode = 2
+        self._mock_subprocess([fake])
+        with patch('pilot_core.glob.glob', return_value=[]):
+            runner = pilot_core.make_cli_runner('/usr/local/bin/ugreen_leds_cli')
+            ok, out, err = runner('power', '-on')
+        self.assertFalse(ok)
+        self.assertEqual(pilot_core.subprocess.run.call_count, 1,
+                         'no retry for non-I2C errors')
+
+    def test_cli_runner_selfheal_fails_returns_error(self):
+        """I2C error and heal fails -> return the CLI error."""
+        import pilot_core
+        fake = MagicMock()
+        fake.stdout = ''
+        fake.stderr = 'Err: fail to open the I2C device. Please check...'
+        fake.returncode = 1
+        self._mock_subprocess([fake])
+        with patch('pilot_core.ensure_i2c_dev', return_value=False):
+            runner = pilot_core.make_cli_runner('/usr/local/bin/ugreen_leds_cli')
+            ok, out, err = runner('power', '-on')
+        self.assertFalse(ok)
+        self.assertIn('I2C', err, 'error surfaced to caller')
+
+
 if __name__ == '__main__':
     unittest.main()

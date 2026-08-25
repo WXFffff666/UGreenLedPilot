@@ -19,6 +19,21 @@ start_process() {
         return 0
     fi
 
+    # Reboot-safe: install_init only loads i2c-dev once at install time, so
+    # after a reboot the module is gone and /dev/i2c-* nodes are missing —
+    # every LED control then fails with "fail to open the I2C device".
+    # Reload the module here on every start so the app works after reboot.
+    if ! ls /dev/i2c-* > /dev/null 2>&1; then
+        log_msg "i2c-dev module not loaded, attempting modprobe..."
+        modprobe i2c-dev 2>/dev/null
+        udevadm settle 2>/dev/null || true
+        if ls /dev/i2c-* > /dev/null 2>&1; then
+            log_msg "i2c-dev module loaded"
+        else
+            log_msg "WARNING: failed to load i2c-dev. Run: sudo modprobe i2c-dev"
+        fi
+    fi
+
     log_msg "Starting process ..."
     log_msg "Command: ${CMD}"
     nohup python3 ${TRIM_APPDEST}/server/main.py >> "${LOG_FILE}" 2>&1 &

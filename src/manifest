@@ -1,6 +1,6 @@
 appname               = UGreenLedPilot
 
-version               = 2.3.0
+version               = 2.3.1
 
 display_name          = UGreen LED Pilot
 
@@ -22,5 +22,4 @@ desktop_applaunchname = UGreenLedPilot.Application
 
 service_port          = 19580
 
-changelog             = v2.3.0: 定时策略（夜间窗口自动调暗/关闭，白天自动恢复）；磁盘消失/网络断开红色闪烁告警 + UI 横幅；首次登录强制修改默认密码；fnOS 桌面 iframe 嵌入式窗口；版本号与发布对齐。
-
+changelog             = v2.3.1: 修复重启后 I2C 驱动丢失（"fail to open the I2C device"）——cmd/main 启动时自动加载 i2c-dev 模块；CLI 运行时自愈（检测 I2C 错误自动 modprobe 重试）。

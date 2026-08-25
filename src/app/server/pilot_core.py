@@ -96,6 +96,43 @@ def run_cmd(*args):
         return False, '', str(e)
 
 
+# Substrings that identify the CLI's I2C-open failure. install_init loads
+# i2c-dev once at install time; after a reboot the module is gone and
+# /dev/i2c-* nodes disappear, so every CLI call fails until the module is
+# reloaded. The app runs as root, so we can modprobe at runtime and retry.
+I2C_ERR_MARKERS = (
+    'fail to open the i2c device',
+    'i2c-dev module is loaded',
+    'no such file or directory',
+)
+
+
+def _is_i2c_error(stderr):
+    low = (stderr or '').lower()
+    return any(marker in low for marker in I2C_ERR_MARKERS)
+
+
+def ensure_i2c_dev():
+    """Best-effort: load the i2c-dev kernel module so /dev/i2c-* exists.
+
+    Returns True when I2C device nodes are present after the attempt.
+    modprobe is idempotent; udevadm settle lets udev create the nodes.
+    """
+    if glob.glob('/dev/i2c-*'):
+        return True
+    try:
+        subprocess.run(['modprobe', 'i2c-dev'], capture_output=True, text=True,
+                       timeout=5)
+    except Exception:
+        pass
+    try:
+        subprocess.run(['udevadm', 'settle'], capture_output=True, text=True,
+                       timeout=5)
+    except Exception:
+        pass
+    return bool(glob.glob('/dev/i2c-*'))
+
+
 def make_cli_runner(cli_path):
     """All LED hardware control goes through ugreen_leds_cli only."""
     if not os.path.isfile(cli_path):
@@ -103,7 +140,15 @@ def make_cli_runner(cli_path):
 
     def run(*args):
         try:
-            r = subprocess.run([cli_path] + list(args), capture_output=True, text=True, timeout=5)
+            r = subprocess.run([cli_path] + list(args), capture_output=True,
+                               text=True, timeout=5)
+            if r.returncode != 0 and _is_i2c_error(r.stderr):
+                # Self-heal: i2c-dev module may have dropped (e.g. after a
+                # reboot). Reload it once and retry the CLI call.
+                if ensure_i2c_dev():
+                    r = subprocess.run([cli_path] + list(args),
+                                       capture_output=True, text=True,
+                                       timeout=5)
             return r.returncode == 0, r.stdout.strip(), r.stderr.strip()
         except FileNotFoundError:
             return False, '', f'CLI not found: {cli_path}'
